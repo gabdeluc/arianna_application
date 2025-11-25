@@ -2,7 +2,7 @@
 
 Questo progetto fornisce un ambiente di sviluppo containerizzato completo con un backend FastAPI (Python) e un frontend React (JavaScript), orchestrati tramite Docker Compose.
 
-## 📋 Indice
+## Indice
 
 - [Prerequisiti](#prerequisiti)
 - [Struttura del Progetto](#struttura-del-progetto)
@@ -11,7 +11,7 @@ Questo progetto fornisce un ambiente di sviluppo containerizzato completo con un
 - [Endpoint API](#endpoint-api)
 - [Troubleshooting](#troubleshooting)
 
-## 🔧 Prerequisiti
+## Prerequisiti
 
 Prima di iniziare, assicurati di avere installato:
 
@@ -47,7 +47,7 @@ project-root/
 └── README.md
 ```
 
-## 🚀 Installazione e Avvio
+## Installazione e Avvio
 
 ### 1. Clona o crea la struttura del progetto
 
@@ -83,7 +83,7 @@ Apri il browser e visita [http://localhost:3000](http://localhost:3000). Dovrest
 - Il messaggio "Hello from FastAPI" restituito dal backend
 - Una conferma "✓ Connessione al backend riuscita!"
 
-## 🏗️ Architettura
+## Architettura
 
 ### Backend (FastAPI)
 
@@ -128,7 +128,7 @@ Restituisce un messaggio di benvenuto.
 
 **Status Code:** 200 OK
 
-## 🐛 Troubleshooting
+## Troubleshooting
 
 ### Il frontend non riesce a connettersi al backend
 
@@ -184,7 +184,7 @@ docker-compose logs -f backend
 docker-compose logs -f frontend
 ```
 
-## 🛑 Fermare lo stack
+## Fermare lo stack
 
 Per fermare tutti i container:
 
