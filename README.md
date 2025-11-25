@@ -197,18 +197,3 @@ Per fermare e rimuovere anche i volumi:
 ```bash
 docker-compose down -v
 ```
-
-## 📝 Prossimi Passi
-
-Ora che l'architettura di base è funzionante, puoi:
-
-1. Aggiungere nuovi endpoint al backend
-2. Creare componenti React aggiuntivi nel frontend
-3. Implementare un database (PostgreSQL, MongoDB, ecc.)
-4. Aggiungere autenticazione e autorizzazione
-5. Implementare test automatizzati
-6. Configurare CI/CD pipeline
-
-## 📄 Licenza
-
-Questo progetto è fornito "così com'è" per scopi educativi e di sviluppo.
