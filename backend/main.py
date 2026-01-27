@@ -102,7 +102,7 @@ for meeting_config in MEETINGS_CONFIG:
     }
 
 # ============================================
-# ENDPOINTS - RISPETTANO IL TUO SCHEMA
+# ENDPOINTS - RISPETTANO LO SCHEMA
 # ============================================
 
 @app.get("/")
@@ -155,7 +155,7 @@ def get_meeting(meetingId: str):
     """
     GET meeting/{meetingId}
     
-    Response come da tuo formato:
+    Response come da formato:
     {
       "metadata": {
         "participants": [...],
@@ -174,7 +174,7 @@ def get_transcript_full(meetingId: str):
     """
     GET meeting/{meetingId}/transcript/
     
-    Response come da tuo formato:
+    Response come da formato:
     {
       "transcript": [
         {

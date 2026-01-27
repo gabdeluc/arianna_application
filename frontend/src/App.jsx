@@ -212,8 +212,8 @@ function App() {
         }}>
           <strong>💡 Data Format:</strong>
           <ul style={{ margin: '0.5rem 0 0 0', paddingLeft: '1.5rem' }}>
-            <li>Backend rispetta il tuo format con campi: <code>uid</code>, <code>nickname</code>, <code>text</code>, <code>from</code>, <code>to</code></li>
-            <li>Participant IDs come nel tuo esempio: fj93829, dkd9320</li>
+            <li>Backend rispetta il format con campi: <code>uid</code>, <code>nickname</code>, <code>text</code>, <code>from</code>, <code>to</code></li>
+            <li>Participant IDs come nell'esempio: fj93829, dkd9320</li>
             <li>Endpoint: <code>GET /meeting/&#123;meetingId&#125;/transcript/</code></li>
           </ul>
         </div>
