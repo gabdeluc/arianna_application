@@ -1,11 +1,32 @@
-from fastapi import FastAPI, HTTPException
+"""
+Backend Gateway - API Orchestrator
+
+Questo backend orchestra i microservizi ML senza caricare modelli.
+Mantiene la logica business e i dati, delega ML a servizi specializzati.
+
+Architecture:
+- BERT Sentiment Service: http://bert-sentiment:5001
+- E5 Embeddings Service: http://e5-embeddings:5002
+"""
+
+from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field
+import httpx
 import random
+import os
 from config.config_loader import config_loader
 
-app = FastAPI(title="Meeting Transcript API - Minimal")
+# ============================================
+# FASTAPI APP SETUP
+# ============================================
+
+app = FastAPI(
+    title="Meeting Transcript API Gateway",
+    description="Backend orchestrator per microservizi di sentiment analysis",
+    version="2.0.0"
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -16,15 +37,25 @@ app.add_middleware(
 )
 
 # ============================================
-# MODELLI
+# MICROSERVICES CONFIGURATION
+# ============================================
+
+BERT_SERVICE_URL = os.getenv("BERT_SERVICE_URL", "http://bert-sentiment:5001")
+E5_SERVICE_URL = os.getenv("E5_SERVICE_URL", "http://e5-embeddings:5002")
+
+# HTTP client with timeout for service calls
+http_client = httpx.AsyncClient(timeout=30.0)
+
+# ============================================
+# PYDANTIC MODELS (ORIGINALI)
 # ============================================
 
 class TranscriptEntry(BaseModel):
     uid: str
     nickname: str
     text: str
-    from_field: str = Field(..., alias="from", description="Timestamp iniziale formato HH:MM:SS.mmm")
-    to: str = Field(..., description="Timestamp finale formato HH:MM:SS.mmm")
+    from_field: str = Field(..., alias="from", description="Timestamp HH:MM:SS.mmm")
+    to: str = Field(..., description="Timestamp HH:MM:SS.mmm")
 
 class Participant(BaseModel):
     id: str
@@ -45,24 +76,44 @@ class MeetingResponse(BaseModel):
     metadata: MeetingMetadata
 
 # ============================================
-# CARICA CONFIGURAZIONE DA FILE
+# SENTIMENT MODELS
 # ============================================
 
-# Carica dati da YAML
+class SentimentResult(BaseModel):
+    stars: float
+    sentiment: str
+    confidence: float
+
+class SentimentAnalysisRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=5000)
+
+class BatchSentimentRequest(BaseModel):
+    texts: List[str] = Field(..., max_items=100)
+
+class SimilaritySearchRequest(BaseModel):
+    query: str
+    top_k: int = Field(default=5, ge=1, le=20)
+
+# ============================================
+# LOAD CONFIGURATION (ORIGINALE)
+# ============================================
+
 SAMPLE_PHRASES = config_loader.get_sample_phrases()
 PARTICIPANTS_CONFIG = config_loader.get_participants()
 MEETINGS_CONFIG = config_loader.get_meetings()
 GENERATION_CONFIG = config_loader.get_generation_config()
 
-# Converti in oggetti Pydantic
 PARTICIPANTS = [Participant(**p) for p in PARTICIPANTS_CONFIG]
 
+# ============================================
+# MOCK DATA GENERATION (ORIGINALE)
+# ============================================
+
 def generate_mock_transcript(num_entries: int = 20) -> List[TranscriptEntry]:
-    """Genera un transcript mock usando configurazione da file"""
+    """Genera transcript mock usando configurazione"""
     transcript = []
     current_time = 0
     
-    # Usa configurazione per parametri di generazione
     min_duration = GENERATION_CONFIG['min_duration_seconds']
     max_pause = GENERATION_CONFIG['max_pause_seconds']
     chars_per_sec = GENERATION_CONFIG['chars_per_second']
@@ -72,7 +123,6 @@ def generate_mock_transcript(num_entries: int = 20) -> List[TranscriptEntry]:
         text = random.choice(SAMPLE_PHRASES)
         duration = max(min_duration, len(text) // chars_per_sec)
         
-        # Formato: HH:MM:SS.mmm
         from_time = f"{current_time // 3600:02d}:{(current_time % 3600) // 60:02d}:{current_time % 60:02d}.000"
         current_time += duration
         to_time = f"{current_time // 3600:02d}:{(current_time % 3600) // 60:02d}:{current_time % 60:02d}.000"
@@ -89,7 +139,7 @@ def generate_mock_transcript(num_entries: int = 20) -> List[TranscriptEntry]:
     
     return transcript
 
-# Genera mock database da configurazione
+# Initialize mock database
 MOCK_MEETINGS = {}
 for meeting_config in MEETINGS_CONFIG:
     meeting_id = meeting_config['id']
@@ -102,97 +152,144 @@ for meeting_config in MEETINGS_CONFIG:
     }
 
 # ============================================
-# ENDPOINTS - RISPETTANO LO SCHEMA
+# MICROSERVICES COMMUNICATION HELPERS
+# ============================================
+
+async def call_bert_service(endpoint: str, payload: dict) -> dict:
+    """
+    Chiama il servizio BERT per sentiment analysis
+    """
+    try:
+        response = await http_client.post(
+            f"{BERT_SERVICE_URL}/{endpoint}",
+            json=payload,
+            timeout=30.0
+        )
+        response.raise_for_status()
+        return response.json()
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="BERT service timeout"
+        )
+    except httpx.HTTPError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"BERT service error: {str(e)}"
+        )
+
+async def call_e5_service(endpoint: str, payload: dict) -> dict:
+    """
+    Chiama il servizio E5 per embeddings/similarity
+    """
+    try:
+        response = await http_client.post(
+            f"{E5_SERVICE_URL}/{endpoint}",
+            json=payload,
+            timeout=30.0
+        )
+        response.raise_for_status()
+        return response.json()
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="E5 service timeout"
+        )
+    except httpx.HTTPError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"E5 service error: {str(e)}"
+        )
+
+async def check_service_health(service_url: str) -> bool:
+    """Verifica se un servizio è online"""
+    try:
+        response = await http_client.get(f"{service_url}/health", timeout=5.0)
+        return response.status_code == 200
+    except:
+        return False
+
+# ============================================
+# MAIN ENDPOINTS
 # ============================================
 
 @app.get("/")
-def root():
-    """Health check"""
+async def root():
+    """
+    Root endpoint con informazioni sul gateway e status dei servizi
+    """
+    # Check services health
+    bert_healthy = await check_service_health(BERT_SERVICE_URL)
+    e5_healthy = await check_service_health(E5_SERVICE_URL)
+    
     return {
         "status": "ok",
-        "config": {
-            "loaded_from": "config/mock_data.yaml",
-            "participants": len(PARTICIPANTS),
-            "meetings": len(MOCK_MEETINGS),
-            "sample_phrases": len(SAMPLE_PHRASES)
-        },
-        "endpoints": [
-            {
-                "method": "GET",
-                "route": "meeting/{meetingId}",
-                "description": "Get meeting metadata"
+        "version": "2.0.0",
+        "architecture": "microservices",
+        "gateway": "FastAPI Backend",
+        "services": {
+            "bert_sentiment": {
+                "url": BERT_SERVICE_URL,
+                "healthy": bert_healthy,
+                "port": 5001
             },
-            {
-                "method": "GET",
-                "route": "meeting/{meetingId}/transcript/",
-                "description": "Get full transcript"
-            },
-            {
-                "method": "GET",
-                "route": "meeting/{meetingId}/transcript?participant-id={participantId}",
-                "description": "Get transcript filtered by participant"
-            },
-            {
-                "method": "GET",
-                "route": "meeting/{meetingId}/character-count",
-                "description": "Count characters (custom endpoint)"
+            "e5_embeddings": {
+                "url": E5_SERVICE_URL,
+                "healthy": e5_healthy,
+                "port": 5002
             }
-        ]
+        },
+        "endpoints": {
+            "original": [
+                "GET /meeting/{meetingId}",
+                "GET /meeting/{meetingId}/transcript/"
+            ],
+            "sentiment": [
+                "POST /sentiment/analyze",
+                "POST /sentiment/batch",
+                "GET /meeting/{meetingId}/sentiment"
+            ],
+            "similarity": [
+                "POST /meeting/{meetingId}/similarity"
+            ],
+            "utility": [
+                "GET /participants",
+                "GET /meetings",
+                "GET /services/status"
+            ]
+        }
     }
 
-@app.get("/config")
-def get_config():
-    """Visualizza la configurazione corrente"""
-    return {
-        "sample_phrases": SAMPLE_PHRASES,
-        "participants": [p.dict() for p in PARTICIPANTS],
-        "meetings": MEETINGS_CONFIG,
-        "generation": GENERATION_CONFIG
-    }
+@app.get("/health")
+def health_check():
+    """Health check per il gateway"""
+    return {"status": "healthy", "service": "backend-gateway"}
+
+# ============================================
+# ORIGINAL ENDPOINTS (INVARIATI)
+# ============================================
 
 @app.get("/meeting/{meetingId}", response_model=MeetingResponse)
 def get_meeting(meetingId: str):
-    """
-    GET meeting/{meetingId}
-    
-    Response come da formato:
-    {
-      "metadata": {
-        "participants": [...],
-        "date": "2024-06-01T10:00:00Z"
-      }
-    }
-    """
+    """Ottieni metadata del meeting"""
     meeting = MOCK_MEETINGS.get(meetingId)
     if not meeting:
-        raise HTTPException(status_code=404, detail=f"Meeting {meetingId} not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Meeting {meetingId} not found"
+        )
     
     return MeetingResponse(metadata=meeting["metadata"])
 
 @app.get("/meeting/{meetingId}/transcript/", response_model=TranscriptResponse)
 def get_transcript_full(meetingId: str):
-    """
-    GET meeting/{meetingId}/transcript/
-    
-    Response come da formato:
-    {
-      "transcript": [
-        {
-          "uid": "12345",
-          "nickname": "Bob",
-          "text": "Hello, everyone...",
-          "from": "00:00:01.000",
-          "to": "00:00:05.000"
-        }
-      ],
-      "metadata": {
-        "language": "en"
-      }
-    }
-    """
+    """Ottieni transcript completo"""
     meeting = MOCK_MEETINGS.get(meetingId)
     if not meeting:
-        raise HTTPException(status_code=404, detail=f"Meeting {meetingId} not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Meeting {meetingId} not found"
+        )
     
     return TranscriptResponse(
         transcript=meeting["transcript"],
@@ -204,14 +301,13 @@ def get_transcript_filtered(
     meetingId: str,
     participant_id: Optional[str] = None
 ):
-    """
-    GET meeting/{meetingId}/transcript?participant-id={participantId}
-    
-    Filtra il transcript per partecipante
-    """
+    """Ottieni transcript con filtro opzionale per partecipante"""
     meeting = MOCK_MEETINGS.get(meetingId)
     if not meeting:
-        raise HTTPException(status_code=404, detail=f"Meeting {meetingId} not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Meeting {meetingId} not found"
+        )
     
     transcript = meeting["transcript"]
     
@@ -229,53 +325,191 @@ def get_transcript_filtered(
         "metadata": {"language": "en"}
     }
 
-@app.get("/meeting/{meetingId}/character-count")
-def get_character_count(
+# ============================================
+# SENTIMENT ANALYSIS ENDPOINTS (NUOVI)
+# Orchestrano chiamate a BERT microservice
+# ============================================
+
+@app.post("/sentiment/analyze")
+async def analyze_sentiment(request: SentimentAnalysisRequest):
+    """
+    Analizza sentiment di un singolo testo tramite BERT microservice
+    """
+    result = await call_bert_service("analyze", {"text": request.text})
+    return result
+
+@app.post("/sentiment/batch")
+async def analyze_sentiment_batch(request: BatchSentimentRequest):
+    """
+    Analizza sentiment per batch di testi tramite BERT microservice
+    """
+    result = await call_bert_service("batch", {"texts": request.texts})
+    return result
+
+@app.get("/meeting/{meetingId}/sentiment")
+async def get_transcript_with_sentiment(
     meetingId: str,
-    participant_id: Optional[str] = None
+    participant_id: Optional[str] = None,
+    include_embeddings: bool = Query(
+        False,
+        description="Includi embeddings E5 (384-dim) - computazionalmente costoso"
+    )
 ):
     """
-    Endpoint CUSTOM per contare i caratteri
-    
-    Query params:
-    - participant_id: conta solo per un partecipante (opzionale)
-    
-    Example:
-    - /meeting/mtg001/character-count
-    - /meeting/mtg001/character-count?participant_id=fj93829
+    Ottieni transcript arricchito con sentiment analysis
     """
-    response = get_transcript_filtered(meetingId, participant_id)
-    transcript = response["transcript"]
+    # 1. Ottieni meeting
+    meeting = MOCK_MEETINGS.get(meetingId)
+    if not meeting:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Meeting {meetingId} not found"
+        )
     
-    total_chars = sum(len(entry.text) for entry in transcript)
-    total_words = sum(len(entry.text.split()) for entry in transcript)
+    transcript = meeting["transcript"]
     
-    result = {
-        "meeting_id": meetingId,
-        "total_characters": total_chars,
-        "total_words": total_words,
-        "total_messages": len(transcript)
-    }
-    
-    # Se filtrato per partecipante, aggiungi info
+    # 2. Filtra per partecipante se richiesto
     if participant_id:
-        participant = next((p for p in PARTICIPANTS if p.id == participant_id), None)
-        if participant:
-            result["participant"] = {
-                "id": participant_id,
-                "name": participant.name
-            }
+        participant_name = next(
+            (p.name for p in PARTICIPANTS if p.id == participant_id),
+            None
+        )
+        if participant_name:
+            transcript = [e for e in transcript if e.nickname == participant_name]
     
-    return result
+    # 3. Estrai testi
+    texts = [entry.text for entry in transcript]
+    
+    if not texts:
+        return {
+            "transcript": [],
+            "metadata": {
+                "language": "en",
+                "sentiment_stats": {
+                    "average_stars": 0,
+                    "positive_ratio": 0,
+                    "total_analyzed": 0
+                }
+            }
+        }
+    
+    # 4. Chiama BERT microservice per sentiment (batch efficiente)
+    sentiment_response = await call_bert_service("batch", {"texts": texts})
+    sentiments = sentiment_response["results"]
+    
+    # 5. Opzionalmente chiama E5 microservice per embeddings
+    embeddings = None
+    if include_embeddings:
+        embedding_response = await call_e5_service("batch-embed", {"texts": texts})
+        embeddings = embedding_response["embeddings"]
+    
+    # 6. Combina transcript con sentiment (e embeddings)
+    enriched_transcript = []
+    total_stars = 0
+    positive_count = 0
+    
+    for i, entry in enumerate(transcript):
+        entry_dict = entry.dict(by_alias=True)
+        entry_dict['sentiment'] = sentiments[i]
+        
+        if embeddings:
+            entry_dict['embedding'] = embeddings[i]
+        
+        enriched_transcript.append(entry_dict)
+        
+        # Accumula per stats
+        total_stars += sentiments[i]['stars']
+        if sentiments[i]['stars'] >= 3.5:
+            positive_count += 1
+    
+    # 7. Calcola statistiche aggregate
+    avg_stars = total_stars / len(sentiments)
+    positive_ratio = positive_count / len(sentiments)
+    
+    return {
+        "transcript": enriched_transcript,
+        "metadata": {
+            "language": "en",
+            "sentiment_stats": {
+                "average_stars": round(avg_stars, 2),
+                "positive_ratio": round(positive_ratio, 2),
+                "total_analyzed": len(sentiments)
+            }
+        }
+    }
+
+# ============================================
+# SIMILARITY SEARCH ENDPOINTS (NUOVI)
+# Orchestrano chiamate a E5 microservice
+# ============================================
+
+@app.post("/meeting/{meetingId}/similarity")
+async def find_similar_messages(
+    meetingId: str,
+    request: SimilaritySearchRequest
+):
+    """
+    Trova messaggi semanticamente simili usando E5 microservice
+    """
+    # 1. Ottieni meeting
+    meeting = MOCK_MEETINGS.get(meetingId)
+    if not meeting:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Meeting {meetingId} not found"
+        )
+    
+    transcript = meeting["transcript"]
+    
+    # 2. Estrai testi candidati
+    candidate_texts = [entry.text for entry in transcript]
+    
+    if not candidate_texts:
+        return {
+            "query": request.query,
+            "similar_messages": []
+        }
+    
+    # 3. Chiama E5 microservice per similarity search
+    similarity_response = await call_e5_service("similarity", {
+        "query": request.query,
+        "candidates": candidate_texts,
+        "top_k": request.top_k
+    })
+    
+    # 4. Arricchisci risultati con metadata del transcript
+    results = similarity_response["results"]
+    similar_messages = []
+    
+    for result in results:
+        # Trova entry originale per ottenere metadata
+        entry = next(e for e in transcript if e.text == result["text"])
+        
+        similar_messages.append({
+            "text": result["text"],
+            "similarity": result["similarity"],
+            "rank": result["rank"],
+            "speaker": entry.nickname,
+            "timestamp": entry.from_field
+        })
+    
+    return {
+        "query": request.query,
+        "similar_messages": similar_messages
+    }
+
+# ============================================
+# UTILITY ENDPOINTS
+# ============================================
 
 @app.get("/participants")
 def get_participants():
-    """Lista dei partecipanti disponibili (da config)"""
+    """Lista tutti i partecipanti disponibili"""
     return {"participants": PARTICIPANTS}
 
 @app.get("/meetings")
 def get_all_meetings():
-    """Lista di tutti i meeting disponibili (da config)"""
+    """Lista tutti i meeting disponibili con metadata"""
     return {
         "meetings": [
             {
@@ -287,3 +521,64 @@ def get_all_meetings():
             for meeting_id, meeting in MOCK_MEETINGS.items()
         ]
     }
+
+@app.get("/services/status")
+async def get_services_status():
+    """
+    Status dettagliato di tutti i microservizi
+    """
+    # Check health
+    bert_healthy = await check_service_health(BERT_SERVICE_URL)
+    e5_healthy = await check_service_health(E5_SERVICE_URL)
+    
+    # Ottieni info dettagliate se servizi online
+    bert_info = None
+    e5_info = None
+    
+    if bert_healthy:
+        try:
+            response = await http_client.get(f"{BERT_SERVICE_URL}/info", timeout=5.0)
+            bert_info = response.json()
+        except:
+            pass
+    
+    if e5_healthy:
+        try:
+            response = await http_client.get(f"{E5_SERVICE_URL}/info", timeout=5.0)
+            e5_info = response.json()
+        except:
+            pass
+    
+    return {
+        "bert_sentiment": {
+            "healthy": bert_healthy,
+            "url": BERT_SERVICE_URL,
+            "port": 5001,
+            "info": bert_info
+        },
+        "e5_embeddings": {
+            "healthy": e5_healthy,
+            "url": E5_SERVICE_URL,
+            "port": 5002,
+            "info": e5_info
+        }
+    }
+
+@app.get("/config")
+def get_config():
+    """Visualizza configurazione corrente (debug)"""
+    return {
+        "sample_phrases": SAMPLE_PHRASES,
+        "participants": [p.dict() for p in PARTICIPANTS],
+        "meetings": MEETINGS_CONFIG,
+        "generation": GENERATION_CONFIG
+    }
+
+# ============================================
+# SHUTDOWN HANDLER
+# ============================================
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup al shutdown"""
+    await http_client.aclose()
