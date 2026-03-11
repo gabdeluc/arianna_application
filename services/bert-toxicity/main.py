@@ -1,14 +1,14 @@
 """
-BERT Sentiment Microservice
+BERT Toxicity Microservice
 
 EDUCATIONAL NOTE FOR FUTURE STUDENTS:
-This is an independent microservice that runs a BERT model for sentiment analysis.
-It receives text as input and returns a 1-5 star rating. The backend gateway then
-normalizes this to positive/neutral/negative labels for the frontend.
+This microservice detects toxic/offensive content in text using BERT.
+Unlike sentiment (1-5 stars), this is a binary classification: toxic or non-toxic.
+The output includes a 0-1 score and a severity level (low/medium/high).
 
-Port: 5001
-Model: nlptown/bert-base-multilingual-uncased-sentiment (110M parameters)
-Output: 1.0-5.0 stars (1=very negative, 5=very positive)
+Port: 5003
+Model: gravitee-io/bert-small-toxicity
+Output: toxicity_score (0-1), is_toxic (bool), severity (low/medium/high)
 """
 
 from fastapi import FastAPI, HTTPException, status
@@ -20,7 +20,7 @@ import logging
 import os
 import time
 
-# Setup logging so we can debug issues in production
+# Setup logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -32,8 +32,8 @@ logger = logging.getLogger(__name__)
 # ============================================
 
 app = FastAPI(
-    title="BERT Sentiment Microservice",
-    description="Sentiment analysis with 1-5 star classification",
+    title="BERT Toxicity Microservice",
+    description="Toxicity detection with 0-1 classification",
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
@@ -43,8 +43,8 @@ app = FastAPI(
 # REQUEST/RESPONSE MODELS
 # ============================================
 
-class SentimentRequest(BaseModel):
-    """Request for analyzing a single text."""
+class ToxicityRequest(BaseModel):
+    """Request for analyzing toxicity in a single text."""
     text: str = Field(
         ...,
         min_length=1,
@@ -54,14 +54,13 @@ class SentimentRequest(BaseModel):
     
     @validator('text')
     def text_not_empty(cls, v):
-        """Ensure the text isn't just whitespace."""
         if not v.strip():
             raise ValueError('Text cannot be empty')
         return v.strip()
 
 
-class BatchSentimentRequest(BaseModel):
-    """Request for analyzing multiple texts in one go (much faster!)."""
+class BatchToxicityRequest(BaseModel):
+    """Request for analyzing toxicity in multiple texts."""
     texts: List[str] = Field(
         ...,
         min_items=1,
@@ -71,24 +70,24 @@ class BatchSentimentRequest(BaseModel):
     
     @validator('texts')
     def texts_not_empty(cls, v):
-        """Filter out empty strings."""
         cleaned = [t.strip() for t in v if t.strip()]
         if not cleaned:
             raise ValueError('At least one text must be non-empty')
         return cleaned
 
 
-class SentimentResponse(BaseModel):
-    """Response with sentiment analysis results."""
-    stars: float = Field(..., ge=1.0, le=5.0, description="Score from 1.0 to 5.0")
-    sentiment: str = Field(..., description="Sentiment category")
+class ToxicityResponse(BaseModel):
+    """Response with toxicity detection results."""
+    toxicity_score: float = Field(..., ge=0.0, le=1.0, description="Toxicity score 0.0-1.0")
+    is_toxic: bool = Field(..., description="True if toxic (score > 0.5)")
     confidence: float = Field(..., ge=0.0, le=1.0, description="Prediction confidence")
-    processing_time_ms: Optional[float] = Field(None, description="Processing time in milliseconds")
+    label: str = Field(..., description="toxic/non-toxic")
+    processing_time_ms: Optional[float] = Field(None, description="Processing time in ms")
 
 
-class BatchSentimentResponse(BaseModel):
-    """Response for batch predictions."""
-    results: List[SentimentResponse]
+class BatchToxicityResponse(BaseModel):
+    """Response for batch toxicity detection."""
+    results: List[ToxicityResponse]
     total_processed: int
     total_time_ms: float
 
@@ -106,29 +105,27 @@ class ModelInfoResponse(BaseModel):
     model_name: str
     architecture: str
     task: str
-    languages: List[str]
-    parameters: str
+    output_range: str
     device: str
     max_input_length: int
-    output_classes: int
+    threshold: float
 
 # ============================================
-# BERT MODEL MANAGER (Singleton)
+# BERT TOXICITY MODEL MANAGER (Singleton)
 # ============================================
 
-class BERTSentimentModel:
+class BERTToxicityModel:
     """
-    Singleton pattern for managing the BERT model.
+    Singleton for managing the BERT toxicity model.
     
     EDUCATIONAL NOTE:
-    We use Singleton because BERT is heavy (~500MB in RAM). We want to load it ONCE
-    when the service starts, not on every request. All requests share the same model instance.
+    Binary classification: the model outputs 2 probabilities (non-toxic, toxic).
+    We use probability of "toxic" class as the toxicity score.
     
-    Features:
-    - Lazy loading (loads on first use)
-    - Thread-safe
-    - Batch processing optimization
-    - Error handling
+    Severity levels based on score:
+    - LOW: score < 0.4 (safe conversation)
+    - MEDIUM: score 0.4-0.7 (borderline, watch carefully)
+    - HIGH: score > 0.7 (toxic, needs moderation)
     """
     
     _instance = None
@@ -141,48 +138,43 @@ class BERTSentimentModel:
         return cls._instance
     
     def __init__(self):
-        """Initialize BERT model (runs only once due to singleton)."""
+        """Initialize BERT toxicity model (runs only once)."""
         if self._initialized:
             return
         
         self.model_name = os.getenv(
             'MODEL_NAME',
-            'nlptown/bert-base-multilingual-uncased-sentiment'
+            'gravitee-io/bert-small-toxicity'
         )
         
-        # Use GPU if available (10x faster than CPU)
+        # Use GPU if available
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         
+        # Threshold for binary classification
+        self.threshold = 0.5
+        
         logger.info("="*60)
-        logger.info("🚀 Initializing BERT Sentiment Service")
+        logger.info("🚀 Initializing BERT Toxicity Service")
         logger.info(f"📦 Model: {self.model_name}")
         logger.info(f"🖥️  Device: {self.device}")
+        logger.info(f"🎯 Threshold: {self.threshold}")
         
         try:
-            # Load tokenizer (converts text to numbers BERT understands)
+            # Load tokenizer
             logger.info("📥 Loading tokenizer...")
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
             
-            # Load model (downloads ~500MB on first run, then cached)
+            # Load model
             logger.info("📥 Loading model...")
             self.model = AutoModelForSequenceClassification.from_pretrained(
                 self.model_name
             ).to(self.device)
             
-            # Set to evaluation mode (disables dropout, batch norm)
+            # Set to evaluation mode
             self.model.eval()
             
-            # Map model outputs to sentiment labels
-            self.sentiment_map = {
-                0: "very_negative",
-                1: "negative",
-                2: "neutral",
-                3: "positive",
-                4: "very_positive"
-            }
-            
-            # Stars values for weighted average calculation
-            self.stars_values = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0]).to(self.device)
+            # Label mapping (0=non-toxic, 1=toxic)
+            self.id2label = {0: "non-toxic", 1: "toxic"}
             
             self._initialized = True
             
@@ -199,58 +191,58 @@ class BERTSentimentModel:
         return_probabilities: bool = False
     ) -> Dict[str, Any]:
         """
-        Analyze sentiment of a single text.
-        
-        EDUCATIONAL NOTE:
-        The model outputs 5 probabilities (one per star rating).
-        We calculate a weighted average: stars = sum(probability[i] * star[i])
-        Example: [0.1, 0.1, 0.2, 0.4, 0.2] → 1*0.1 + 2*0.1 + 3*0.2 + 4*0.4 + 5*0.2 = 3.5 stars
+        Analyze toxicity of a single text.
         
         Args:
             text: Text to analyze
             return_probabilities: If True, include per-class probabilities
             
         Returns:
-            Dict with stars, sentiment, confidence, processing_time_ms
+            Dict with toxicity_score, is_toxic, confidence, label
         """
         start_time = time.time()
         
         try:
-            # Tokenization: Convert text to token IDs
-            # Example: "Hello world" → [101, 7592, 2088, 102]
+            # Tokenization
             inputs = self.tokenizer(
                 text,
                 return_tensors="pt",
                 truncation=True,
-                max_length=512,  # BERT's max input length
+                max_length=512,
                 padding=True
             ).to(self.device)
             
-            # Inference: Run the model
-            # We use torch.no_grad() to save memory (we're not training)
+            # Inference
             with torch.no_grad():
                 outputs = self.model(**inputs)
                 logits = outputs.logits
                 probs = torch.softmax(logits, dim=1)[0]
             
-            # Calculate weighted stars (more precise than just argmax)
-            weighted_stars = (probs * self.stars_values).sum().item()
+            # Toxicity score = probability of "toxic" class
+            toxicity_score = probs[1].item()
             
-            # Predicted class (most likely star rating)
-            predicted_class = torch.argmax(probs).item()
+            # Binary classification
+            is_toxic = toxicity_score > self.threshold
+            predicted_class = 1 if is_toxic else 0
+            
+            # Confidence = probability of the predicted class
             confidence = probs[predicted_class].item()
             
-            processing_time = (time.time() - start_time) * 1000  # Convert to milliseconds
+            processing_time = (time.time() - start_time) * 1000
             
             result = {
-                'stars': round(weighted_stars, 2),
-                'sentiment': self.sentiment_map[predicted_class],
+                'toxicity_score': round(toxicity_score, 3),
+                'is_toxic': is_toxic,
                 'confidence': round(confidence, 3),
+                'label': self.id2label[predicted_class],
                 'processing_time_ms': round(processing_time, 2)
             }
             
             if return_probabilities:
-                result['probabilities'] = probs.cpu().numpy().tolist()
+                result['probabilities'] = {
+                    'non-toxic': round(probs[0].item(), 3),
+                    'toxic': round(probs[1].item(), 3)
+                }
             
             return result
             
@@ -265,22 +257,16 @@ class BERTSentimentModel:
         """
         Analyze batch of texts (10x faster than individual calls).
         
-        EDUCATIONAL NOTE:
-        Batch processing is faster because:
-        1. GPU can process all texts in parallel
-        2. Tokenization is vectorized
-        3. Only 1 model forward pass instead of N
-        
         Args:
             texts: List of texts to analyze
             
         Returns:
-            List of sentiment results
+            List of toxicity results
         """
         start_time = time.time()
         
         try:
-            # Batch tokenization (processes all texts at once)
+            # Batch tokenization
             inputs = self.tokenizer(
                 texts,
                 return_tensors="pt",
@@ -295,18 +281,20 @@ class BERTSentimentModel:
                 logits = outputs.logits
                 probs = torch.softmax(logits, dim=1)
             
-            # Process each result
+            # Process results
             results = []
             
             for i, prob in enumerate(probs):
-                weighted_stars = (prob * self.stars_values).sum().item()
-                predicted_class = torch.argmax(prob).item()
+                toxicity_score = prob[1].item()
+                is_toxic = toxicity_score > self.threshold
+                predicted_class = 1 if is_toxic else 0
                 confidence = prob[predicted_class].item()
                 
                 results.append({
-                    'stars': round(weighted_stars, 2),
-                    'sentiment': self.sentiment_map[predicted_class],
+                    'toxicity_score': round(toxicity_score, 3),
+                    'is_toxic': is_toxic,
                     'confidence': round(confidence, 3),
+                    'label': self.id2label[predicted_class],
                     'processing_time_ms': None  # Calculated at batch level
                 })
             
@@ -327,8 +315,7 @@ class BERTSentimentModel:
 # GLOBAL MODEL INSTANCE
 # ============================================
 
-# Model is initialized on service startup
-bert_model: Optional[BERTSentimentModel] = None
+toxicity_model: Optional[BERTToxicityModel] = None
 
 # ============================================
 # STARTUP/SHUTDOWN EVENTS
@@ -337,13 +324,13 @@ bert_model: Optional[BERTSentimentModel] = None
 @app.on_event("startup")
 async def startup_event():
     """Initialize model when service starts."""
-    global bert_model
+    global toxicity_model
     
-    logger.info("🚀 Starting BERT Sentiment Microservice...")
+    logger.info("🚀 Starting BERT Toxicity Microservice...")
     
     try:
-        bert_model = BERTSentimentModel()
-        logger.info("✅ Service ready and listening on port 5001")
+        toxicity_model = BERTToxicityModel()
+        logger.info("✅ Service ready and listening on port 5003")
     except Exception as e:
         logger.error(f"❌ Failed to start service: {e}")
         raise
@@ -352,10 +339,10 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on shutdown."""
-    logger.info("🛑 Shutting down BERT Sentiment Microservice...")
+    logger.info("🛑 Shutting down BERT Toxicity Microservice...")
     
     # Free GPU memory if using CUDA
-    if bert_model and bert_model.device == "cuda":
+    if toxicity_model and toxicity_model.device == "cuda":
         torch.cuda.empty_cache()
     
     logger.info("✅ Shutdown complete")
@@ -368,11 +355,11 @@ async def shutdown_event():
 def root():
     """Root endpoint with service information."""
     return {
-        "service": "BERT Sentiment Analysis Microservice",
+        "service": "BERT Toxicity Analysis Microservice",
         "version": "1.0.0",
-        "model": bert_model.model_name if bert_model else "Not loaded",
-        "device": bert_model.device if bert_model else "Unknown",
-        "status": "running" if bert_model and bert_model._initialized else "initializing",
+        "model": toxicity_model.model_name if toxicity_model else "Not loaded",
+        "device": toxicity_model.device if toxicity_model else "Unknown",
+        "status": "running" if toxicity_model and toxicity_model._initialized else "initializing",
         "endpoints": {
             "analyze": "POST /analyze",
             "batch": "POST /batch",
@@ -389,7 +376,7 @@ def health_check():
     
     Used by Docker healthcheck and monitoring tools.
     """
-    if not bert_model or not bert_model._initialized:
+    if not toxicity_model or not toxicity_model._initialized:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Model not loaded"
@@ -398,53 +385,53 @@ def health_check():
     return HealthResponse(
         status="healthy",
         model_loaded=True,
-        device=bert_model.device,
-        model_name=bert_model.model_name
+        device=toxicity_model.device,
+        model_name=toxicity_model.model_name
     )
 
 
-@app.post("/analyze", response_model=SentimentResponse, tags=["Sentiment Analysis"])
-def analyze_sentiment(request: SentimentRequest):
+@app.post("/analyze", response_model=ToxicityResponse, tags=["Toxicity Analysis"])
+def analyze_toxicity(request: ToxicityRequest):
     """
-    Analyze sentiment of a single text.
+    Analyze toxicity of a single text.
     
     Example Request:
-        {"text": "This meeting was very productive!"}
+        {"text": "You are stupid and useless!"}
     
     Example Response:
         {
-            "stars": 4.8,
-            "sentiment": "very_positive",
-            "confidence": 0.92,
-            "processing_time_ms": 45.23
+            "toxicity_score": 0.89,
+            "is_toxic": true,
+            "confidence": 0.89,
+            "label": "toxic",
+            "processing_time_ms": 42.15
         }
     """
-    if not bert_model or not bert_model._initialized:
+    if not toxicity_model or not toxicity_model._initialized:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Model not initialized"
         )
     
     try:
-        result = bert_model.analyze(request.text)
-        return SentimentResponse(**result)
+        result = toxicity_model.analyze(request.text)
+        return ToxicityResponse(**result)
         
     except Exception as e:
-        logger.error(f"Sentiment analysis error: {e}")
+        logger.error(f"Toxicity analysis error: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error during sentiment analysis: {str(e)}"
+            detail=f"Error during toxicity analysis: {str(e)}"
         )
 
 
-@app.post("/batch", response_model=BatchSentimentResponse, tags=["Sentiment Analysis"])
-def batch_analyze_sentiment(request: BatchSentimentRequest):
+@app.post("/batch", response_model=BatchToxicityResponse, tags=["Toxicity Analysis"])
+def batch_analyze_toxicity(request: BatchToxicityRequest):
     """
-    Analyze sentiment for batch of texts (much faster!).
+    Analyze toxicity for batch of texts (much faster!).
     
     EDUCATIONAL NOTE:
     Batch processing is ~10x faster than individual calls.
-    Use this when analyzing multiple messages.
     
     Limits:
     - Minimum: 1 text
@@ -454,23 +441,23 @@ def batch_analyze_sentiment(request: BatchSentimentRequest):
         {
             "texts": [
                 "Great work!",
-                "This is terrible",
-                "Not sure about this"
+                "This is terrible and you are awful",
+                "Thank you for your help"
             ]
         }
     
     Example Response:
         {
             "results": [
-                {"stars": 4.9, "sentiment": "very_positive", "confidence": 0.95},
-                {"stars": 1.2, "sentiment": "very_negative", "confidence": 0.88},
-                {"stars": 2.8, "sentiment": "neutral", "confidence": 0.71}
+                {"toxicity_score": 0.05, "is_toxic": false, "label": "non-toxic"},
+                {"toxicity_score": 0.92, "is_toxic": true, "label": "toxic"},
+                {"toxicity_score": 0.03, "is_toxic": false, "label": "non-toxic"}
             ],
             "total_processed": 3,
-            "total_time_ms": 120.5
+            "total_time_ms": 115.8
         }
     """
-    if not bert_model or not bert_model._initialized:
+    if not toxicity_model or not toxicity_model._initialized:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Model not initialized"
@@ -478,11 +465,11 @@ def batch_analyze_sentiment(request: BatchSentimentRequest):
     
     try:
         start_time = time.time()
-        results = bert_model.batch_analyze(request.texts)
+        results = toxicity_model.batch_analyze(request.texts)
         total_time = (time.time() - start_time) * 1000
         
-        return BatchSentimentResponse(
-            results=[SentimentResponse(**r) for r in results],
+        return BatchToxicityResponse(
+            results=[ToxicityResponse(**r) for r in results],
             total_processed=len(results),
             total_time_ms=round(total_time, 2)
         )
@@ -491,7 +478,7 @@ def batch_analyze_sentiment(request: BatchSentimentRequest):
         logger.error(f"Batch analysis error: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error during batch sentiment analysis: {str(e)}"
+            detail=f"Error during batch toxicity analysis: {str(e)}"
         )
 
 
@@ -500,23 +487,22 @@ def model_info():
     """
     Get detailed model information.
     
-    Returns architecture details, supported languages, etc.
+    Returns architecture details, thresholds, etc.
     """
-    if not bert_model or not bert_model._initialized:
+    if not toxicity_model or not toxicity_model._initialized:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Model not initialized"
         )
     
     return ModelInfoResponse(
-        model_name=bert_model.model_name,
-        architecture="BERT-base (12 layers, 768 hidden)",
-        task="Sentiment Classification (1-5 stars)",
-        languages=["en", "nl", "de", "fr", "it", "es"],
-        parameters="~110M",
-        device=bert_model.device,
+        model_name=toxicity_model.model_name,
+        architecture="BERT-small (6 layers, 512 hidden)",
+        task="Binary Toxicity Classification",
+        output_range="0.0 (non-toxic) - 1.0 (toxic)",
+        device=toxicity_model.device,
         max_input_length=512,
-        output_classes=5
+        threshold=toxicity_model.threshold
     )
 
 # ============================================
@@ -526,7 +512,7 @@ def model_info():
 if __name__ == "__main__":
     import uvicorn
     
-    port = int(os.getenv("PORT", 5001))
+    port = int(os.getenv("PORT", 5003))
     
     uvicorn.run(
         app,

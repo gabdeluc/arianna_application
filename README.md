@@ -203,3 +203,4 @@ docker-compose down -v
 # docker-compose down -v
 
 # docker system prune -a --volumes
+# docker-compose exec backend sh

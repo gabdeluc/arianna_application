@@ -1,711 +1,571 @@
 import { useState, useEffect } from 'react'
+import { Bar, Line, Doughnut } from 'react-chartjs-2'
+import {
+  Chart as ChartJS,
+  CategoryScale,
+  LinearScale,
+  PointElement,
+  LineElement,
+  BarElement,
+  ArcElement,
+  Title,
+  Tooltip,
+  Legend,
+  Filler
+} from 'chart.js'
+
+ChartJS.register(
+  CategoryScale,
+  LinearScale,
+  PointElement,
+  LineElement,
+  BarElement,
+  ArcElement,
+  Title,
+  Tooltip,
+  Legend,
+  Filler
+)
 
 const API_URL = 'http://localhost:8000'
 
 function App() {
-  // ============================================
-  // STATE MANAGEMENT
-  // ============================================
-  
-  const [isPanelOpen, setIsPanelOpen] = useState(false)
-  const [activeView, setActiveView] = useState('overview')
+  const [meetingData, setMeetingData] = useState(null)
+  const [participants, setParticipants] = useState([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
-  const [transcriptSentiment, setTranscriptSentiment] = useState(null)
-  const [similarResults, setSimilarResults] = useState(null)
-  const [searchQuery, setSearchQuery] = useState('')
 
-  // ============================================
-  // LOGICA CALCOLO DATI (MESSAGGI, PARTECIPANTI, DURATA)
-  // ============================================
+  const [widgetConfigs, setWidgetConfigs] = useState({
+    messages: { participantFilter: null, color: '#FF3B30', showDetails: true },
+    sentiment: { participantFilter: null, color: '#34C759', showDetails: true },
+    toxicity: { participantFilter: null, color: '#FF9500', showDetails: true },
+    sentimentDist: { participantFilter: null, color: '#007AFF', showLabels: true, animated: true },
+    toxicityGauge: { participantFilter: null, color: '#5856D6', showDetails: true },
+    timelineSentiment: { participantFilter: null, color: '#00C7BE', showGrid: true, showArea: true, metric: 'sentiment' },
+    timelineToxicity: { participantFilter: null, color: '#FF6B6B', showGrid: true, showArea: true, metric: 'toxicity' },
+    messageStream: { participantFilter: null, color: '#FF2D55', limit: 30, showTimestamps: true }
+  })
 
-  // Calcoliamo i dati per la dashboard principale solo se transcriptSentiment esiste
-  const dashboardStats = transcriptSentiment ? {
-    messages: transcriptSentiment.transcript.length,
-    participants: new Set(transcriptSentiment.transcript.map(t => t.nickname)).size,
-    // Prendiamo il timestamp dell'ultimo messaggio come durata approssimativa
-    duration: transcriptSentiment.transcript.length > 0 
-      ? transcriptSentiment.transcript[transcriptSentiment.transcript.length - 1].from 
-      : "00:00",
-    // Stima grezza dei token (caratteri / 4 è una media standard per l'inglese/italiano)
-    tokens: Math.round(transcriptSentiment.transcript.reduce((acc, curr) => acc + curr.text.length, 0) / 4)
-  } : {
-    messages: '-',
-    participants: '-',
-    duration: '-',
-    tokens: '-'
-  }
-
-  // ============================================
-  // EFFECTS
-  // ============================================
-  
-  useEffect(() => {
-    if (isPanelOpen && !transcriptSentiment && !loading) {
-      loadTranscriptSentiment()
+  const [visibleWidgets, setVisibleWidgets] = useState(() => {
+    const saved = localStorage.getItem('visibleWidgets')
+    return saved ? JSON.parse(saved) : {
+      messages: true, sentiment: true, toxicity: true, sentimentDist: true,
+      toxicityGauge: true, timelineSentiment: true, timelineToxicity: true, messageStream: true
     }
-  }, [isPanelOpen])
+  })
 
-  // ============================================
-  // API CALLS
-  // ============================================
-  
-  const loadTranscriptSentiment = async () => {
+  const [openSettings, setOpenSettings] = useState(null)
+  const [showWidgetPanel, setShowWidgetPanel] = useState(false)
+
+  useEffect(() => { loadInitialData() }, [])
+  useEffect(() => { localStorage.setItem('visibleWidgets', JSON.stringify(visibleWidgets)) }, [visibleWidgets])
+
+  const loadInitialData = async () => {
     setLoading(true)
-    setError(null)
-    
     try {
-      const response = await fetch(`${API_URL}/meeting/mtg001/sentiment?include_embeddings=false`)
+      const respPart = await fetch(`${API_URL}/participants`)
+      const dataPart = await respPart.json()
+      setParticipants(dataPart.participants)
+
+      const response = await fetch(`${API_URL}/meeting/mtg001/analysis`)
       if (!response.ok) throw new Error(`Status ${response.status}`)
       const data = await response.json()
-      setTranscriptSentiment(data)
+      setMeetingData(data)
+      setError(null)
     } catch (err) {
-      setError('Impossibile sincronizzare i dati della sessione.')
-      setTranscriptSentiment(null)
+      setError('Unable to load meeting data')
     } finally {
       setLoading(false)
     }
   }
 
-  const searchSimilar = async () => {
-    if (!searchQuery.trim()) return
-    setLoading(true)
-    setError(null)
-    
-    try {
-      const response = await fetch(`${API_URL}/meeting/mtg001/similarity`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: searchQuery, top_k: 5 })
-      })
-      if (!response.ok) throw new Error(`Status ${response.status}`)
-      const data = await response.json()
-      setSimilarResults(data)
-      setActiveView('similarity')
-    } catch (err) {
-      setError('Errore nel motore di ricerca semantica.')
-    } finally {
-      setLoading(false)
+  const updateWidgetConfig = (widgetId, updates) => {
+    setWidgetConfigs(prev => ({ ...prev, [widgetId]: { ...prev[widgetId], ...updates } }))
+  }
+
+  const toggleWidgetVisibility = (widgetId) => {
+    setVisibleWidgets(prev => ({ ...prev, [widgetId]: !prev[widgetId] }))
+  }
+
+  const getFilteredTranscript = (widgetId) => {
+    if (!meetingData || !meetingData.transcript) return []
+    const config = widgetConfigs[widgetId]
+    if (!config.participantFilter) return meetingData.transcript
+    const participant = participants.find(p => p.id === config.participantFilter)
+    if (!participant) return meetingData.transcript
+    return meetingData.transcript.filter(entry => entry.nickname === participant.name)
+  }
+
+  const calculateStats = (transcript) => {
+    if (!transcript || transcript.length === 0) {
+      return {
+        total_messages: 0,
+        sentiment: { distribution: { positive: 0, neutral: 0, negative: 0 }, average_score: 0, positive_ratio: 0 },
+        toxicity: { toxic_count: 0, toxic_ratio: 0, severity_distribution: { low: 0, medium: 0, high: 0 }, average_toxicity_score: 0 }
+      }
+    }
+    const total = transcript.length
+    let sentimentScoreSum = 0, toxicityScoreSum = 0
+    const sentimentDist = { positive: 0, neutral: 0, negative: 0 }
+    const severityDist = { low: 0, medium: 0, high: 0 }
+    let toxicCount = 0
+
+    transcript.forEach(entry => {
+      const sentLabel = entry.sentiment.label
+      if (sentimentDist[sentLabel] !== undefined) sentimentDist[sentLabel]++
+      sentimentScoreSum += entry.sentiment.score
+      if (entry.toxicity.is_toxic) toxicCount++
+      const severity = entry.toxicity.severity
+      if (severityDist[severity] !== undefined) severityDist[severity]++
+      toxicityScoreSum += entry.toxicity.toxicity_score
+    })
+
+    return {
+      total_messages: total,
+      sentiment: { distribution: sentimentDist, average_score: sentimentScoreSum / total, positive_ratio: sentimentDist.positive / total },
+      toxicity: { toxic_count: toxicCount, toxic_ratio: toxicCount / total, severity_distribution: severityDist, average_toxicity_score: toxicityScoreSum / total }
     }
   }
 
-  const handleSearchKeyPress = (e) => {
-    if (e.key === 'Enter') searchSimilar()
-  }
-
-  // ============================================
-  // RENDER
-  // ============================================
+  const widgetSections = [
+    {
+      title: 'Key Metrics',
+      widgets: [
+        { id: 'messages', name: 'Messages', description: 'Total message count' },
+        { id: 'sentiment', name: 'Sentiment Overview', description: 'Average sentiment score' },
+        { id: 'toxicity', name: 'Toxic Messages', description: 'Toxic message count' }
+      ]
+    },
+    {
+      title: 'Analytics',
+      widgets: [
+        { id: 'sentimentDist', name: 'Sentiment Distribution', description: 'Breakdown by category' },
+        { id: 'timelineSentiment', name: 'Sentiment Timeline', description: 'Sentiment over time' },
+        { id: 'timelineToxicity', name: 'Toxicity Timeline', description: 'Toxicity over time' },
+        { id: 'toxicityGauge', name: 'Toxicity Severity', description: 'Current toxicity level' }
+      ]
+    },
+    {
+      title: 'Content',
+      widgets: [
+        { id: 'messageStream', name: 'Message Stream', description: 'Recent messages feed' }
+      ]
+    }
+  ]
 
   return (
     <div style={styles.appContainer}>
-      {/* SIDEBAR - Dark & Professional */}
-      <div style={styles.sidebar}>
-        <div style={styles.sidebarHeader}>
-          <div style={styles.logoCircle}>M</div>
-          <span style={styles.logoText}>MEETING<br/>INTELLIGENCE</span>
-        </div>
-
-        <div style={styles.sidebarNav}>
-          <SidebarItem 
-            label="Dashboard Operativa"
-            onClick={() => setIsPanelOpen(false)}
-            active={!isPanelOpen}
-          />
-          <SidebarItem 
-            label="Analisi AI"
-            onClick={() => setIsPanelOpen(!isPanelOpen)}
-            active={isPanelOpen}
-            badge={transcriptSentiment ? 'Ready' : null}
-          />
-          <SidebarItem 
-            label="Configurazione"
-            onClick={() => alert('Funzionalità riservata agli amministratori')}
-          />
-        </div>
-
-        <div style={styles.sidebarFooter}>
-          <div style={styles.userProfile}>
-            <div style={styles.userAvatar}>AD</div>
-            <div style={styles.userInfo}>
-              <span style={styles.userName}>Admin User</span>
-              <span style={styles.userRole}>Enterprise Plan</span>
+      <div style={styles.header}>
+        <div style={styles.headerContent}>
+          <div style={styles.headerLeft}>
+            <div style={styles.logoCircle}>MI</div>
+            <div style={styles.headerText}>
+              <h1 style={styles.title}>Meeting Intelligence</h1>
+              <p style={styles.subtitle}>MTG-001 · Unique Design</p>
             </div>
           </div>
+          
+          <button onClick={() => setShowWidgetPanel(!showWidgetPanel)} style={styles.widgetToggleBtn}>
+            <span style={styles.widgetToggleIcon}>⚙️</span>
+            <span style={styles.widgetToggleText}>Customize</span>
+          </button>
         </div>
       </div>
 
-      {/* SLIDE-OUT PANEL */}
-      {isPanelOpen && (
-        <div style={styles.panel}>
-          <div style={styles.panelHeader}>
-            <div>
-              <h2 style={styles.panelTitle}>Analisi Riunione</h2>
-              <span style={styles.panelSubtitle}>ID: MTG-001 • Elaborazione Completata</span>
+      {/* UNIQUE DESIGN WIDGET PANEL */}
+      {showWidgetPanel && (
+        <div style={styles.widgetPanelOverlay} onClick={() => setShowWidgetPanel(false)}>
+          <div style={styles.widgetPanelContainer} onClick={(e) => e.stopPropagation()}>
+            <div style={styles.widgetPanelHeader}>
+              <h2 style={styles.widgetPanelTitle}>Customize Dashboard</h2>
+              <button onClick={() => setShowWidgetPanel(false)} style={styles.widgetPanelCloseBtn}>Close</button>
             </div>
-            <button
-              onClick={() => setIsPanelOpen(false)}
-              style={styles.panelClose}
-            >
-              ✕
-            </button>
-          </div>
-
-          <div style={styles.searchContainer}>
-            <input
-              type="text"
-              placeholder="Cerca insights nel transcript..."
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              onKeyPress={handleSearchKeyPress}
-              style={styles.searchInput}
-            />
-          </div>
-
-          <div style={styles.tabContainer}>
-            <TabButton
-              label="Overview"
-              active={activeView === 'overview'}
-              onClick={() => setActiveView('overview')}
-            />
-            <TabButton
-              label="Transcript"
-              active={activeView === 'messages'}
-              onClick={() => setActiveView('messages')}
-            />
-            {similarResults && (
-              <TabButton
-                label={`Risultati (${similarResults.similar_messages.length})`}
-                active={activeView === 'similarity'}
-                onClick={() => setActiveView('similarity')}
-              />
-            )}
-          </div>
-
-          <div style={styles.panelContent}>
-            {error && (
-              <div style={styles.errorBanner}>
-                <div style={styles.errorDot}></div>
-                {error}
+            
+            <div style={styles.widgetPanelContent}>
+              {widgetSections.map((section, sectionIdx) => (
+                <div key={section.title} style={styles.widgetSection}>
+                  <div style={styles.sectionHeader}>{section.title}</div>
+                  <div style={styles.sectionContent}>
+                    {section.widgets.map((widget, widgetIdx) => (
+                      <div key={widget.id}>
+                        <div 
+                          style={styles.widgetRow}
+                          onClick={() => toggleWidgetVisibility(widget.id)}
+                        >
+                          <div style={styles.widgetRowLeft}>
+                            <div style={styles.widgetRowTitle}>{widget.name}</div>
+                            <div style={styles.widgetRowDescription}>{widget.description}</div>
+                          </div>
+                          <div style={styles.widgetRowRight}>
+                            {/* UNIQUE TOGGLE BUTTON - COMPLETELY ORIGINAL */}
+                            <button
+                              style={{
+                                ...styles.uniqueToggle,
+                                backgroundColor: visibleWidgets[widget.id] ? '#007AFF' : '#3a3a3c',
+                                color: visibleWidgets[widget.id] ? '#fff' : '#8e8e93'
+                              }}
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                toggleWidgetVisibility(widget.id)
+                              }}
+                            >
+                              <span style={styles.toggleText}>
+                                {visibleWidgets[widget.id] ? 'ON' : 'OFF'}
+                              </span>
+                            </button>
+                          </div>
+                        </div>
+                        {widgetIdx < section.widgets.length - 1 && <div style={styles.separator} />}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+              
+              <div style={styles.widgetPanelFooter}>
+                <p style={styles.footerText}>
+                  {Object.values(visibleWidgets).filter(Boolean).length} of {Object.keys(visibleWidgets).length} widgets enabled
+                </p>
               </div>
-            )}
-
-            {loading && (
-              <div style={styles.loadingContainer}>
-                <div style={styles.loaderLine}></div>
-                <p>Elaborazione NLP in corso...</p>
-              </div>
-            )}
-
-            {!loading && transcriptSentiment && activeView === 'overview' && (
-              <OverviewView data={transcriptSentiment} />
-            )}
-
-            {!loading && transcriptSentiment && activeView === 'messages' && (
-              <MessagesView data={transcriptSentiment} />
-            )}
-
-            {!loading && similarResults && activeView === 'similarity' && (
-              <SimilarityView data={similarResults} />
-            )}
+            </div>
           </div>
         </div>
       )}
 
-      {/* MAIN CONTENT AREA */}
-      <div style={{
-        ...styles.mainContent,
-        marginLeft: isPanelOpen ? '680px' : '280px' // Sidebar (280) + Panel (400)
-      }}>
-        <div style={styles.topNav}>
-          <span style={styles.breadcrumb}>Home / Meeting / <strong>MTG-001</strong></span>
-          <div style={styles.statusBadge}>
-            {transcriptSentiment ? '● Online' : '○ Offline'}
+      {error && (
+        <div style={styles.errorBanner}>
+          <span style={styles.errorIcon}>!</span>
+          <span>{error}</span>
+        </div>
+      )}
+
+      {loading && (
+        <div style={styles.loadingContainer}>
+          <div style={styles.spinner}></div>
+          <p style={styles.loadingText}>Loading...</p>
+        </div>
+      )}
+
+      {!loading && meetingData && (
+        <div style={styles.widgetGrid}>
+          {visibleWidgets.messages && (
+            <CustomizableWidget widgetId="messages" title="Messages" config={widgetConfigs.messages} participants={participants} onConfigChange={(u) => updateWidgetConfig('messages', u)} openSettings={openSettings} setOpenSettings={setOpenSettings}>
+              {(() => {
+                const data = getFilteredTranscript('messages')
+                return <><div style={styles.kpiValue}>{data.length}</div><div style={styles.kpiLabel}>Total messages</div></>
+              })()}
+            </CustomizableWidget>
+          )}
+
+          {visibleWidgets.sentiment && (
+            <CustomizableWidget widgetId="sentiment" title="Sentiment" config={widgetConfigs.sentiment} participants={participants} onConfigChange={(u) => updateWidgetConfig('sentiment', u)} openSettings={openSettings} setOpenSettings={setOpenSettings}>
+              {(() => {
+                const data = getFilteredTranscript('sentiment')
+                const stats = calculateStats(data)
+                return <><div style={styles.kpiValue}>{(stats.sentiment.average_score * 100).toFixed(0)}%</div><div style={styles.kpiLabel}>{(stats.sentiment.positive_ratio * 100).toFixed(0)}% positive</div></>
+              })()}
+            </CustomizableWidget>
+          )}
+
+          {visibleWidgets.toxicity && (
+            <CustomizableWidget widgetId="toxicity" title="Toxic Messages" config={widgetConfigs.toxicity} participants={participants} onConfigChange={(u) => updateWidgetConfig('toxicity', u)} openSettings={openSettings} setOpenSettings={setOpenSettings}>
+              {(() => {
+                const data = getFilteredTranscript('toxicity')
+                const stats = calculateStats(data)
+                return <><div style={styles.kpiValue}>{stats.toxicity.toxic_count}</div><div style={styles.kpiLabel}>{(stats.toxicity.toxic_ratio * 100).toFixed(0)}% toxic</div></>
+              })()}
+            </CustomizableWidget>
+          )}
+
+          {visibleWidgets.sentimentDist && (
+            <CustomizableWidget widgetId="sentimentDist" title="Sentiment Distribution" config={widgetConfigs.sentimentDist} participants={participants} onConfigChange={(u) => updateWidgetConfig('sentimentDist', u)} openSettings={openSettings} setOpenSettings={setOpenSettings} wide>
+              {(() => {
+                const data = getFilteredTranscript('sentimentDist')
+                const stats = calculateStats(data)
+                return <SentimentDistributionChartJS data={stats.sentiment.distribution} config={widgetConfigs.sentimentDist} />
+              })()}
+            </CustomizableWidget>
+          )}
+
+          {visibleWidgets.timelineSentiment && (
+            <CustomizableWidget widgetId="timelineSentiment" title="Sentiment Timeline" config={widgetConfigs.timelineSentiment} participants={participants} onConfigChange={(u) => updateWidgetConfig('timelineSentiment', u)} openSettings={openSettings} setOpenSettings={setOpenSettings} wide>
+              {(() => {
+                const data = getFilteredTranscript('timelineSentiment')
+                return <TimelineChartJS messages={data} config={widgetConfigs.timelineSentiment} />
+              })()}
+            </CustomizableWidget>
+          )}
+
+          {visibleWidgets.timelineToxicity && (
+            <CustomizableWidget widgetId="timelineToxicity" title="Toxicity Timeline" config={widgetConfigs.timelineToxicity} participants={participants} onConfigChange={(u) => updateWidgetConfig('timelineToxicity', u)} openSettings={openSettings} setOpenSettings={setOpenSettings} wide>
+              {(() => {
+                const data = getFilteredTranscript('timelineToxicity')
+                return <TimelineChartJS messages={data} config={widgetConfigs.timelineToxicity} />
+              })()}
+            </CustomizableWidget>
+          )}
+
+          {visibleWidgets.toxicityGauge && (
+            <CustomizableWidget widgetId="toxicityGauge" title="Toxicity Severity" config={widgetConfigs.toxicityGauge} participants={participants} onConfigChange={(u) => updateWidgetConfig('toxicityGauge', u)} openSettings={openSettings} setOpenSettings={setOpenSettings}>
+              {(() => {
+                const data = getFilteredTranscript('toxicityGauge')
+                const stats = calculateStats(data)
+                return <ToxicityGaugeChartJS score={stats.toxicity.average_toxicity_score} config={widgetConfigs.toxicityGauge} />
+              })()}
+            </CustomizableWidget>
+          )}
+
+          {visibleWidgets.messageStream && (
+            <CustomizableWidget widgetId="messageStream" title="Message Stream" config={widgetConfigs.messageStream} participants={participants} onConfigChange={(u) => updateWidgetConfig('messageStream', u)} openSettings={openSettings} setOpenSettings={setOpenSettings} wide>
+              {(() => {
+                const data = getFilteredTranscript('messageStream')
+                return <MessageStream messages={data.slice(0, widgetConfigs.messageStream.limit)} config={widgetConfigs.messageStream} />
+              })()}
+            </CustomizableWidget>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// Components (same but I'll include for completeness)
+function SentimentDistributionChartJS({ data, config }) {
+  if (!data) return <div style={styles.emptyState}>No data</div>
+  const total = (data.positive || 0) + (data.neutral || 0) + (data.negative || 0)
+  if (total === 0) return <div style={styles.emptyState}>No data</div>
+  return (
+    <div style={{ height: '150px' }}>
+      <Bar 
+        data={{ labels: ['Distribution'], datasets: [
+          { label: 'Positive', data: [data.positive || 0], backgroundColor: '#34C759', borderRadius: 8 },
+          { label: 'Neutral', data: [data.neutral || 0], backgroundColor: '#FFCC00', borderRadius: 8 },
+          { label: 'Negative', data: [data.negative || 0], backgroundColor: '#FF3B30', borderRadius: 8 }
+        ]}}
+        options={{ indexAxis: 'y', responsive: true, maintainAspectRatio: false, plugins: { legend: { display: config.showLabels, position: 'bottom', labels: { color: '#8e8e93', padding: 10, font: { size: 11 } } }, tooltip: { backgroundColor: 'rgba(28, 28, 30, 0.95)', callbacks: { label: (ctx) => `${ctx.dataset.label}: ${ctx.parsed.x} (${((ctx.parsed.x/total)*100).toFixed(0)}%)` } } }, scales: { x: { stacked: true, grid: { color: 'rgba(255, 255, 255, 0.05)' }, ticks: { color: '#8e8e93' } }, y: { stacked: true, display: false } }, animation: { duration: config.animated ? 500 : 0 } }}
+      />
+    </div>
+  )
+}
+
+function TimelineChartJS({ messages, config }) {
+  if (!messages || messages.length === 0) return <div style={styles.emptyState}>No data</div>
+  const formatTime = (ts) => { const parts = ts.split(':'); return `${parseInt(parts[1])}:${parts[2].split('.')[0].padStart(2, '0')}` }
+  const dataPoints = messages.map((msg, idx) => ({ x: idx, y: config.metric === 'sentiment' ? msg.sentiment.score : msg.toxicity.toxicity_score, timestamp: msg.from, formattedTime: formatTime(msg.from), nickname: msg.nickname, text: msg.text }))
+  const xLabels = dataPoints.map((dp, idx) => { const step = Math.max(1, Math.floor(messages.length / 10)); return (idx === 0 || idx === messages.length - 1 || idx % step === 0) ? dp.formattedTime : '' })
+  const chartColor = config.color || (config.metric === 'sentiment' ? '#00C7BE' : '#FF6B6B')
+  return (
+    <div style={{ height: '280px' }}>
+      <Line data={{ labels: xLabels, datasets: [{ label: config.metric === 'sentiment' ? 'Sentiment' : 'Toxicity', data: dataPoints.map(p => p.y), borderColor: chartColor, backgroundColor: config.showArea ? chartColor + '30' : 'transparent', borderWidth: 3, fill: config.showArea, tension: 0.4, pointRadius: 4, pointHoverRadius: 6 }] }} options={{ responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false }, tooltip: { backgroundColor: 'rgba(28, 28, 30, 0.95)', callbacks: { title: (ctx) => `${dataPoints[ctx[0].dataIndex].nickname} - ${dataPoints[ctx[0].dataIndex].timestamp}`, label: (ctx) => `${config.metric === 'sentiment' ? 'Sentiment' : 'Toxicity'}: ${(ctx.parsed.y * 100).toFixed(0)}%` } } }, scales: { x: { grid: { display: config.showGrid }, ticks: { autoSkip: false, font: { size: 9 } } }, y: { min: 0, max: 1, grid: { display: config.showGrid }, ticks: { callback: (v) => `${(v*100).toFixed(0)}%` } } } }} />
+    </div>
+  )
+}
+
+function ToxicityGaugeChartJS({ score, config }) {
+  const safeScore = score ?? 0
+  const getColor = () => safeScore < 0.3 ? '#34C759' : safeScore < 0.6 ? '#FFCC00' : '#FF3B30'
+  const getLabel = () => safeScore < 0.3 ? 'LOW' : safeScore < 0.6 ? 'MEDIUM' : 'HIGH'
+  return (
+    <div style={styles.gaugeContainer}>
+      <div style={{ height: '160px', position: 'relative' }}>
+        <Doughnut data={{ datasets: [{ data: [safeScore * 100, (1 - safeScore) * 100], backgroundColor: [getColor(), 'rgba(255, 255, 255, 0.05)'], borderWidth: 0, circumference: 180, rotation: 270 }] }} options={{ responsive: true, maintainAspectRatio: false, cutout: '75%', plugins: { legend: { display: false }, tooltip: { enabled: false } } }} />
+        <div style={{ position: 'absolute', top: '55%', left: '50%', transform: 'translate(-50%, -50%)', textAlign: 'center' }}>
+          <div style={{ ...styles.gaugeValue, color: getColor() }}>{(safeScore * 100).toFixed(0)}%</div>
+          <div style={styles.gaugeLabel}>{getLabel()}</div>
+        </div>
+      </div>
+      {config.showDetails && (
+        <div style={styles.gaugeDetails}>
+          <div style={styles.detailItem}>
+            <span style={styles.detailLabel}>Score</span>
+            <span style={styles.detailValue}>{safeScore.toFixed(3)}</span>
           </div>
         </div>
-
-        <div style={styles.contentWrapper}>
-          <div style={styles.heroSection}>
-            <h1 style={styles.pageTitle}>Meeting Board</h1>
-            <p style={styles.pageSubtitle}>Piattaforma centralizzata per la gestione dei verbali.</p>
-          </div>
-          
-          <div style={styles.mainCard}>
-            <div style={styles.cardHeaderBorder}>
-              <h2 style={styles.cardTitle}>Dettagli Sessione</h2>
-            </div>
-            
-            <div style={styles.cardBody}>
-              <p style={{lineHeight: '1.6', color: '#475569', marginBottom: '2rem'}}>
-                {transcriptSentiment 
-                  ? "I dati visualizzati di seguito sono calcolati in tempo reale dal motore NLP basato sul transcript recuperato." 
-                  : "Nessun dato caricato. Apri il pannello 'Analisi AI' sulla sinistra per inizializzare il caricamento e popolare le statistiche."}
-              </p>
-
-              <div style={styles.statsRow}>
-                <FeatureBox 
-                  title="Messaggi Totali" 
-                  value={dashboardStats.messages} 
-                  icon="💬"
-                />
-                <FeatureBox 
-                  title="Partecipanti" 
-                  value={dashboardStats.participants} 
-                  icon="👥"
-                />
-                <FeatureBox 
-                  title="Durata Stimata" 
-                  value={dashboardStats.duration} 
-                  icon="⏱️"
-                />
-                <FeatureBox 
-                  title="Token (Est.)" 
-                  value={dashboardStats.tokens} 
-                  icon="🔢"
-                />
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
+      )}
     </div>
   )
 }
 
-// ============================================
-// COMPONENTS
-// ============================================
-
-function SidebarItem({ label, onClick, active, badge }) {
-  return (
-    <div
-      onClick={onClick}
-      style={{
-        ...styles.sidebarItem,
-        ...(active ? styles.sidebarItemActive : {})
-      }}
-    >
-      <div style={styles.sidebarLabelContainer}>
-        {active && <div style={styles.activeIndicator}></div>}
-        <span style={{...styles.sidebarLabel, fontWeight: active ? '600' : '400'}}>
-          {label}
-        </span>
-      </div>
-      {badge && <span style={styles.sidebarBadge}>{badge}</span>}
-    </div>
-  )
+function MessageStream({ messages, config }) {
+  if (!messages || messages.length === 0) return <div style={styles.emptyState}>No messages</div>
+  return <div style={styles.messageStreamContainer}>{messages.map((msg) => <MessageBubble key={msg.uid} message={msg} config={config} />)}</div>
 }
 
-function TabButton({ label, active, onClick }) {
-  return (
-    <button
-      onClick={onClick}
-      style={{
-        ...styles.tabButton,
-        ...(active ? styles.tabButtonActive : {})
-      }}
-    >
-      {label}
-    </button>
-  )
-}
-
-function OverviewView({ data }) {
-  const stats = data.metadata.sentiment_stats
-
-  return (
-    <div style={styles.viewContainer}>
-      <h3 style={styles.sectionHeader}>KPI Sentiment</h3>
-      
-      <div style={styles.kpiGrid}>
-        <KpiCard label="Average Score" value={stats.average_stars.toFixed(1)} sub="/ 5.0" color="#3b82f6" />
-        <KpiCard label="Positivity Rate" value={(stats.positive_ratio * 100).toFixed(0)} sub="%" color="#10b981" />
-        <KpiCard label="Total Messages" value={stats.total_analyzed} sub="" color="#6366f1" />
-      </div>
-
-      <div style={styles.chartSection}>
-        <h4 style={styles.chartTitle}>Distribuzione Tono</h4>
-        <SentimentBar data={data.transcript} />
-        <div style={styles.chartLegend}>
-          <span>Negative</span>
-          <span>Neutral</span>
-          <span>Positive</span>
-        </div>
-      </div>
-
-      <div style={styles.insightCard}>
-        <div style={styles.insightHeader}>AUTO-INSIGHTS</div>
-        <ul style={styles.insightList}>
-          <li>Il sentiment complessivo è <strong>{stats.average_stars >= 3 ? 'Positivo' : 'Critico'}</strong>.</li>
-          <li>Rilevata predominanza di interventi {stats.positive_ratio > 0.5 ? 'costruttivi' : 'neutri o critici'}.</li>
-        </ul>
-      </div>
-    </div>
-  )
-}
-
-function MessagesView({ data }) {
-  return (
-    <div style={styles.viewContainer}>
-      <h3 style={styles.sectionHeader}>Transcript Log</h3>
-      <div style={styles.messageStream}>
-        {data.transcript.map((entry, idx) => (
-          <MessageBubble key={idx} entry={entry} />
-        ))}
-      </div>
-    </div>
-  )
-}
-
-function SimilarityView({ data }) {
-  return (
-    <div style={styles.viewContainer}>
-      <h3 style={styles.sectionHeader}>Risultati Semantici</h3>
-      <div style={styles.queryBadge}>Query: {data.query}</div>
-      <div style={styles.resultsStack}>
-        {data.similar_messages.map((msg, idx) => (
-          <SimilarResultRow key={idx} message={msg} />
-        ))}
-      </div>
-    </div>
-  )
-}
-
-function KpiCard({ label, value, sub, color }) {
-  return (
-    <div style={styles.kpiCard}>
-      <div style={styles.kpiLabel}>{label}</div>
-      <div style={{...styles.kpiValue, color}}>{value}<span style={styles.kpiSub}>{sub}</span></div>
-    </div>
-  )
-}
-
-function SentimentBar({ data }) {
-  const counts = { very_positive: 0, positive: 0, neutral: 0, negative: 0, very_negative: 0 }
-  data.forEach(entry => counts[entry.sentiment.sentiment]++)
-  const total = data.length
-  
-  const colors = {
-    very_positive: '#059669', positive: '#34d399', neutral: '#94a3b8', negative: '#f87171', very_negative: '#dc2626'
+function MessageBubble({ message, config }) {
+  const getSentimentColor = (label) => ({ positive: '#34C759', neutral: '#FFCC00', negative: '#FF3B30' }[label] || '#8e8e93')
+  const getToxicityBadge = (tox) => {
+    const colors = { low: '#34C759', medium: '#FF9500', high: '#FF3B30' }
+    return { text: tox.severity.toUpperCase(), color: colors[tox.severity] || '#8e8e93' }
   }
-
+  const badge = getToxicityBadge(message.toxicity)
   return (
-    <div style={styles.barTrack}>
-      {Object.keys(counts).map(key => {
-        const pct = (counts[key] / total) * 100
-        return pct > 0 ? (
-          <div key={key} style={{...styles.barFill, width: `${pct}%`, backgroundColor: colors[key]}} />
-        ) : null
-      })}
-    </div>
-  )
-}
-
-function MessageBubble({ entry }) {
-  const sentimentColor = {
-    'very_positive': '#10b981', 'positive': '#34d399', 'neutral': '#cbd5e1', 'negative': '#f87171', 'very_negative': '#ef4444'
-  }[entry.sentiment.sentiment]
-
-  return (
-    <div style={{...styles.msgBubble, borderLeft: `4px solid ${sentimentColor}`}}>
-      <div style={styles.msgMeta}>
-        <span style={styles.msgAuthor}>{entry.nickname}</span>
-        <span style={styles.msgScore}>{entry.sentiment.stars.toFixed(1)}</span>
-      </div>
-      <p style={styles.msgText}>{entry.text}</p>
-      <div style={styles.msgTime}>{entry.from}</div>
-    </div>
-  )
-}
-
-function SimilarResultRow({ message }) {
-  const opacity = Math.max(0.4, message.similarity); 
-  return (
-    <div style={{...styles.resultRow, opacity}}>
-      <div style={styles.resultRank}>#{message.rank}</div>
-      <div style={styles.resultContent}>
-        <div style={styles.resultText}>"{message.text}"</div>
-        <div style={styles.resultMeta}>
-          <span style={styles.resultMatch}>{(message.similarity * 100).toFixed(0)}% Match</span>
-          <span> • {message.speaker}</span>
+    <div style={styles.messageBubble}>
+      <div style={styles.bubbleHeader}>
+        <span style={styles.bubbleAuthor}>{message.nickname}</span>
+        <div style={styles.bubbleBadges}>
+          <span style={{ ...styles.sentimentBadge, backgroundColor: getSentimentColor(message.sentiment.label) }}>{(message.sentiment.score * 100).toFixed(0)}%</span>
+          <span style={{ ...styles.toxicBadge, backgroundColor: badge.color }}>{badge.text}</span>
         </div>
       </div>
+      <p style={styles.bubbleText}>{message.text}</p>
+      {config.showTimestamps && <span style={styles.bubbleTime}>{message.from}</span>}
     </div>
   )
 }
 
-function FeatureBox({ title, value, icon }) {
+function CustomizableWidget({ widgetId, title, children, config, participants, onConfigChange, openSettings, setOpenSettings, wide }) {
+  const isOpen = openSettings === widgetId
   return (
-    <div style={styles.featureBox}>
-      <div style={styles.fbIcon}>{icon}</div>
-      <div style={styles.fbValue}>{value}</div>
-      <div style={styles.fbTitle}>{title}</div>
+    <div style={{ ...styles.iosWidget, ...(wide && styles.wideWidget) }}>
+      <div style={styles.widgetHeader}>
+        <span style={styles.widgetTitle}>{title}</span>
+        <div style={styles.headerActions}>
+          <div style={{ ...styles.widgetDot, backgroundColor: config.color }} />
+          <button onClick={() => setOpenSettings(isOpen ? null : widgetId)} style={styles.settingsButton}>{isOpen ? '✕' : '⋯'}</button>
+        </div>
+      </div>
+      {isOpen && <WidgetSettings config={config} participants={participants} onConfigChange={onConfigChange} />}
+      <div style={styles.widgetContent}>{children}</div>
     </div>
   )
 }
 
-// ============================================
-// STYLES SYSTEM
-// ============================================
-
-const styles = {
-  appContainer: {
-    display: 'flex',
-    minHeight: '100vh',
-    backgroundColor: '#f1f5f9', 
-    fontFamily: '"Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
-    color: '#334155'
-  },
-
-  // SIDEBAR (Dark Theme)
-  sidebar: {
-    width: '280px',
-    backgroundColor: '#0f172a', 
-    display: 'flex',
-    flexDirection: 'column',
-    position: 'fixed',
-    left: 0,
-    top: 0,
-    bottom: 0,
-    zIndex: 50,
-    color: '#94a3b8'
-  },
-  sidebarHeader: {
-    padding: '2rem 1.5rem',
-    display: 'flex',
-    alignItems: 'center',
-    gap: '1rem',
-    borderBottom: '1px solid #1e293b'
-  },
-  logoCircle: {
-    width: '32px',
-    height: '32px',
-    backgroundColor: '#3b82f6',
-    borderRadius: '8px',
-    color: 'white',
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    fontWeight: 'bold',
-    fontSize: '0.9rem'
-  },
-  logoText: {
-    color: '#f8fafc',
-    fontSize: '0.75rem',
-    fontWeight: '700',
-    letterSpacing: '1px',
-    lineHeight: '1.2'
-  },
-  sidebarNav: {
-    padding: '1.5rem 1rem',
-    flex: 1,
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '0.25rem'
-  },
-  sidebarItem: {
-    padding: '0.75rem 1rem',
-    borderRadius: '6px',
-    cursor: 'pointer',
-    display: 'flex',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    transition: 'all 0.2s ease',
-    fontSize: '0.9rem'
-  },
-  sidebarItemActive: {
-    backgroundColor: '#1e293b',
-    color: '#f8fafc'
-  },
-  sidebarLabelContainer: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: '0.75rem'
-  },
-  activeIndicator: {
-    width: '6px',
-    height: '6px',
-    borderRadius: '50%',
-    backgroundColor: '#3b82f6',
-    boxShadow: '0 0 8px #3b82f6'
-  },
-  sidebarBadge: {
-    fontSize: '0.65rem',
-    backgroundColor: '#3b82f6',
-    color: 'white',
-    padding: '2px 8px',
-    borderRadius: '12px',
-    fontWeight: '600'
-  },
-  sidebarFooter: {
-    padding: '1.5rem',
-    borderTop: '1px solid #1e293b'
-  },
-  userProfile: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: '0.75rem'
-  },
-  userAvatar: {
-    width: '36px',
-    height: '36px',
-    borderRadius: '50%',
-    backgroundColor: '#334155',
-    color: '#cbd5e1',
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    fontSize: '0.8rem',
-    fontWeight: '600'
-  },
-  userInfo: {
-    display: 'flex',
-    flexDirection: 'column'
-  },
-  userName: { color: '#f8fafc', fontSize: '0.85rem', fontWeight: '500' },
-  userRole: { fontSize: '0.7rem', color: '#64748b' },
-
-  // PANEL (Slide-out)
-  panel: {
-    width: '400px', 
-    backgroundColor: 'white',
-    boxShadow: '-4px 0 24px rgba(0,0,0,0.08)',
-    display: 'flex',
-    flexDirection: 'column',
-    position: 'fixed',
-    left: '280px',
-    top: 0,
-    bottom: 0,
-    zIndex: 40,
-    borderRight: '1px solid #e2e8f0'
-  },
-  panelHeader: {
-    padding: '1.5rem',
-    display: 'flex',
-    justifyContent: 'space-between',
-    alignItems: 'flex-start',
-    borderBottom: '1px solid #f1f5f9'
-  },
-  panelTitle: { fontSize: '1.1rem', fontWeight: '700', color: '#1e293b', margin: 0 },
-  panelSubtitle: { fontSize: '0.75rem', color: '#94a3b8', marginTop: '4px', display: 'block' },
-  panelClose: {
-    background: 'none', border: 'none', color: '#cbd5e1', fontSize: '1.2rem', cursor: 'pointer'
-  },
-
-  // SEARCH & TABS
-  searchContainer: { padding: '1rem 1.5rem', borderBottom: '1px solid #f1f5f9' },
-  searchInput: {
-    width: '100%', boxSizing: 'border-box', padding: '0.75rem 1rem', fontSize: '0.9rem',
-    border: '1px solid #e2e8f0', borderRadius: '8px', outline: 'none',
-    backgroundColor: '#f8fafc', transition: 'all 0.2s',
-    boxShadow: 'inset 0 1px 2px rgba(0,0,0,0.02)'
-  },
-  tabContainer: {
-    display: 'flex', padding: '0.5rem 1.5rem 0', gap: '1.5rem', borderBottom: '1px solid #e2e8f0'
-  },
-  tabButton: {
-    padding: '0.75rem 0', fontSize: '0.85rem', fontWeight: '500', color: '#64748b',
-    border: 'none', background: 'none', cursor: 'pointer', borderBottom: '2px solid transparent',
-    transition: 'color 0.2s'
-  },
-  tabButtonActive: { color: '#3b82f6', borderBottom: '2px solid #3b82f6' },
-
-  // CONTENT AREA
-  panelContent: { flex: 1, overflowY: 'auto', padding: '1.5rem' },
-  
-  viewContainer: { display: 'flex', flexDirection: 'column', gap: '1.5rem' },
-  sectionHeader: { 
-    fontSize: '0.75rem', textTransform: 'uppercase', letterSpacing: '0.05em', 
-    color: '#94a3b8', fontWeight: '600', marginBottom: '0.5rem' 
-  },
-
-  // KPI CARDS
-  kpiGrid: { display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '0.75rem' },
-  kpiCard: {
-    padding: '1rem', backgroundColor: 'white', borderRadius: '8px',
-    border: '1px solid #e2e8f0', boxShadow: '0 1px 2px rgba(0,0,0,0.05)',
-    textAlign: 'center'
-  },
-  kpiLabel: { fontSize: '0.7rem', color: '#64748b', marginBottom: '0.25rem' },
-  kpiValue: { fontSize: '1.25rem', fontWeight: '700', lineHeight: '1' },
-  kpiSub: { fontSize: '0.7rem', fontWeight: '400', opacity: 0.7 },
-
-  // CHARTS
-  chartSection: { padding: '1rem', backgroundColor: '#f8fafc', borderRadius: '8px', border: '1px solid #e2e8f0' },
-  chartTitle: { fontSize: '0.8rem', fontWeight: '600', marginBottom: '0.75rem', color: '#475569' },
-  barTrack: { display: 'flex', height: '12px', borderRadius: '6px', overflow: 'hidden', backgroundColor: '#e2e8f0' },
-  barFill: { height: '100%' },
-  chartLegend: { display: 'flex', justifyContent: 'space-between', fontSize: '0.65rem', color: '#94a3b8', marginTop: '0.5rem' },
-
-  // INSIGHTS
-  insightCard: {
-    padding: '1rem', backgroundColor: '#eff6ff', border: '1px solid #dbeafe', borderRadius: '8px'
-  },
-  insightHeader: { fontSize: '0.7rem', color: '#3b82f6', fontWeight: '700', marginBottom: '0.5rem', letterSpacing: '0.5px' },
-  insightList: { margin: 0, paddingLeft: '1rem', fontSize: '0.85rem', color: '#334155', lineHeight: '1.5' },
-
-  // MESSAGES
-  messageStream: { display: 'flex', flexDirection: 'column', gap: '1rem' },
-  msgBubble: {
-    padding: '1rem', backgroundColor: 'white', borderRadius: '0 8px 8px 0',
-    border: '1px solid #e2e8f0', borderLeftWidth: '4px',
-    boxShadow: '0 1px 2px rgba(0,0,0,0.02)'
-  },
-  msgMeta: { display: 'flex', justifyContent: 'space-between', marginBottom: '0.5rem' },
-  msgAuthor: { fontSize: '0.8rem', fontWeight: '700', color: '#1e293b' },
-  msgScore: { fontSize: '0.7rem', color: '#94a3b8', backgroundColor: '#f1f5f9', padding: '1px 6px', borderRadius: '4px' },
-  msgText: { fontSize: '0.9rem', lineHeight: '1.5', color: '#475569', margin: 0 },
-  msgTime: { fontSize: '0.7rem', color: '#cbd5e1', marginTop: '0.5rem', textAlign: 'right' },
-
-  // SEARCH RESULTS
-  queryBadge: { 
-    display: 'inline-block', fontSize: '0.75rem', color: '#3b82f6', backgroundColor: '#eff6ff', 
-    padding: '4px 8px', borderRadius: '4px', marginBottom: '1rem', border: '1px solid #dbeafe' 
-  },
-  resultsStack: { display: 'flex', flexDirection: 'column', gap: '0.5rem' },
-  resultRow: { 
-    display: 'flex', gap: '0.75rem', padding: '0.75rem', backgroundColor: 'white', 
-    border: '1px solid #e2e8f0', borderRadius: '6px' 
-  },
-  resultRank: { fontSize: '0.8rem', fontWeight: '700', color: '#cbd5e1' },
-  resultContent: { flex: 1 },
-  resultText: { fontSize: '0.85rem', color: '#334155', marginBottom: '0.25rem', fontStyle: 'italic' },
-  resultMatch: { color: '#10b981', fontWeight: '600' },
-  resultMeta: { fontSize: '0.7rem', color: '#94a3b8' },
-
-  // MAIN LAYOUT & HERO
-  mainContent: { flex: 1, transition: 'margin-left 0.3s ease', backgroundColor: '#f1f5f9' },
-  topNav: { 
-    height: '60px', borderBottom: '1px solid #e2e8f0', backgroundColor: 'white', 
-    display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 2rem' 
-  },
-  breadcrumb: { fontSize: '0.85rem', color: '#64748b' },
-  statusBadge: { fontSize: '0.75rem', color: '#10b981', fontWeight: '600', backgroundColor: '#ecfdf5', padding: '4px 8px', borderRadius: '12px' },
-  contentWrapper: { padding: '2rem 3rem', maxWidth: '1200px', margin: '0 auto' },
-  heroSection: { marginBottom: '2.5rem' },
-  pageTitle: { fontSize: '1.8rem', fontWeight: '800', color: '#0f172a', margin: '0 0 0.5rem 0', letterSpacing: '-0.02em' },
-  pageSubtitle: { fontSize: '1rem', color: '#64748b' },
-  
-  mainCard: { 
-    backgroundColor: 'white', borderRadius: '12px', 
-    boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03)',
-    border: '1px solid #e2e8f0'
-  },
-  cardHeaderBorder: { padding: '1.5rem 2rem', borderBottom: '1px solid #f1f5f9' },
-  cardTitle: { fontSize: '1.1rem', fontWeight: '600', color: '#1e293b', margin: 0 },
-  cardBody: { padding: '2rem' },
-  
-  statsRow: { display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '2rem', marginTop: '2rem' },
-  featureBox: { padding: '1.5rem', backgroundColor: '#f8fafc', borderRadius: '8px', textAlign: 'center', border: '1px solid #e2e8f0' },
-  fbIcon: { fontSize: '1.5rem', marginBottom: '0.5rem', filter: 'grayscale(100%) opacity(0.7)' }, // Icone desaturate per stile formale
-  fbValue: { fontSize: '1.8rem', fontWeight: '700', color: '#3b82f6', marginBottom: '0.25rem', lineHeight: '1.2' },
-  fbTitle: { fontSize: '0.7rem', fontWeight: '600', color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.5px' },
-
-  // UTILS
-  errorBanner: { padding: '1rem', backgroundColor: '#fef2f2', border: '1px solid #fee2e2', borderRadius: '6px', color: '#991b1b', fontSize: '0.85rem', display: 'flex', alignItems: 'center', gap: '0.5rem' },
-  errorDot: { width: '8px', height: '8px', borderRadius: '50%', backgroundColor: '#ef4444' },
-  loadingContainer: { padding: '3rem', textAlign: 'center', color: '#64748b', fontSize: '0.85rem' },
-  loaderLine: { width: '40px', height: '4px', backgroundColor: '#3b82f6', margin: '0 auto 1rem auto', borderRadius: '2px' }
+function WidgetSettings({ config, participants, onConfigChange }) {
+  return (
+    <div style={styles.settingsPanel}>
+      <div style={styles.settingRow}>
+        <span style={styles.settingLabel}>Filter</span>
+        <select value={config.participantFilter || ''} onChange={(e) => onConfigChange({ participantFilter: e.target.value || null })} style={styles.settingSelect}>
+          <option value="">All</option>
+          {participants.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+        </select>
+      </div>
+    </div>
+  )
 }
+
+// UNIQUE DESIGN STYLES
+const styles = {
+  appContainer: { minHeight: '100vh', width: '100%', backgroundColor: '#1c1c1e', fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif', color: '#fff', overflowX: 'hidden', position: 'relative' },
+  header: { position: 'sticky', top: 0, left: 0, right: 0, zIndex: 100, backgroundColor: 'rgba(28, 28, 30, 0.95)', backdropFilter: 'saturate(180%) blur(20px)', WebkitBackdropFilter: 'saturate(180%) blur(20px)', borderBottom: '0.5px solid rgba(255, 255, 255, 0.1)', padding: 'clamp(0.5rem, 2vw, 0.75rem) clamp(0.75rem, 3vw, 1rem)', boxShadow: '0 2px 10px rgba(0, 0, 0, 0.3)' },
+  headerContent: { maxWidth: '1400px', margin: '0 auto', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 'clamp(0.5rem, 2vw, 0.75rem)' },
+  headerLeft: { display: 'flex', alignItems: 'center', gap: 'clamp(0.5rem, 2vw, 0.75rem)', flex: '1 1 auto', minWidth: '0' },
+  logoCircle: { width: 'clamp(32px, 8vw, 40px)', height: 'clamp(32px, 8vw, 40px)', borderRadius: 'clamp(8px, 2vw, 10px)', background: 'linear-gradient(135deg, #FF3B30 0%, #FF9500 100%)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 'clamp(0.85rem, 2.5vw, 1rem)', fontWeight: '700', flexShrink: 0 },
+  headerText: { flex: '1', minWidth: '0', overflow: 'hidden' },
+  title: { margin: 0, fontSize: 'clamp(0.85rem, 3.5vw, 1.25rem)', fontWeight: '700', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
+  subtitle: { margin: 0, fontSize: 'clamp(0.65rem, 2vw, 0.85rem)', color: '#8e8e93' },
+  widgetToggleBtn: { padding: 'clamp(0.5rem, 2vw, 0.6rem) clamp(0.75rem, 3vw, 1rem)', borderRadius: 'clamp(8px, 2vw, 10px)', border: 'none', background: 'rgba(255, 255, 255, 0.1)', color: '#fff', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: 'clamp(0.75rem, 2vw, 0.85rem)', fontWeight: '600', transition: 'all 0.2s', flexShrink: 0, minWidth: '44px', minHeight: '44px', justifyContent: 'center' },
+  widgetToggleIcon: { fontSize: 'clamp(0.95rem, 2.5vw, 1.1rem)' },
+  widgetToggleText: { display: 'inline' },
+  
+  // PANEL
+  widgetPanelOverlay: { position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0, 0, 0, 0.5)', backdropFilter: 'blur(8px)', WebkitBackdropFilter: 'blur(8px)', zIndex: 200, display: 'flex', alignItems: 'flex-end', justifyContent: 'center', animation: 'fadeIn 0.2s ease-out' },
+  widgetPanelContainer: { width: '100%', maxWidth: '600px', maxHeight: '85vh', backgroundColor: '#1c1c1e', borderTopLeftRadius: '20px', borderTopRightRadius: '20px', boxShadow: '0 -4px 30px rgba(0, 0, 0, 0.6)', display: 'flex', flexDirection: 'column', animation: 'slideUp 0.3s cubic-bezier(0.32, 0.72, 0, 1)', margin: '0 1rem' },
+  widgetPanelHeader: { padding: '1.25rem 1.5rem', borderBottom: '0.5px solid rgba(255, 255, 255, 0.1)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexShrink: 0 },
+  widgetPanelTitle: { margin: 0, fontSize: 'clamp(1.1rem, 3vw, 1.25rem)', fontWeight: '700', letterSpacing: '-0.02em' },
+  widgetPanelCloseBtn: { padding: '0.5rem 1rem', borderRadius: '8px', border: 'none', background: '#007AFF', color: '#fff', fontSize: 'clamp(0.85rem, 2.5vw, 0.95rem)', fontWeight: '600', cursor: 'pointer', transition: 'opacity 0.2s' },
+  widgetPanelContent: { flex: 1, overflowY: 'auto', padding: '1rem 0' },
+  widgetSection: { marginBottom: '2rem' },
+  sectionHeader: { padding: '0 1.5rem', fontSize: 'clamp(0.75rem, 2vw, 0.85rem)', fontWeight: '600', color: '#8e8e93', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '0.75rem' },
+  sectionContent: { backgroundColor: '#2c2c2e', borderRadius: '12px', margin: '0 1rem', overflow: 'hidden' },
+  widgetRow: { padding: '1rem 1.25rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '1rem', cursor: 'pointer', transition: 'background-color 0.15s', minHeight: '68px' },
+  widgetRowLeft: { flex: 1, minWidth: 0 },
+  widgetRowTitle: { fontSize: 'clamp(0.9rem, 2.5vw, 1rem)', fontWeight: '500', color: '#fff', marginBottom: '0.25rem', letterSpacing: '-0.01em' },
+  widgetRowDescription: { fontSize: 'clamp(0.75rem, 2vw, 0.85rem)', color: '#8e8e93', lineHeight: '1.4' },
+  widgetRowRight: { flexShrink: 0 },
+  
+  // UNIQUE TOGGLE BUTTON - TEXT BASED (NOT APPLE!)
+  uniqueToggle: {
+    padding: '0.4rem 0.85rem',
+    borderRadius: '6px',
+    border: 'none',
+    fontSize: 'clamp(0.7rem, 2vw, 0.8rem)',
+    fontWeight: '700',
+    letterSpacing: '0.5px',
+    cursor: 'pointer',
+    transition: 'all 0.2s ease',
+    minWidth: '50px',
+    textAlign: 'center',
+    textTransform: 'uppercase',
+    boxShadow: '0 1px 3px rgba(0, 0, 0, 0.3)'
+  },
+  
+  toggleText: {
+    display: 'block'
+  },
+  
+  separator: { height: '0.5px', backgroundColor: 'rgba(255, 255, 255, 0.08)', marginLeft: '1.25rem' },
+  widgetPanelFooter: { padding: '1rem 1.5rem', borderTop: '0.5px solid rgba(255, 255, 255, 0.1)', flexShrink: 0 },
+  footerText: { margin: 0, fontSize: 'clamp(0.75rem, 2vw, 0.85rem)', color: '#8e8e93', textAlign: 'center' },
+  
+  // Rest same
+  widgetGrid: { maxWidth: '1400px', margin: '0 auto', padding: 'clamp(0.75rem, 2vw, 1rem)', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(clamp(240px, 60vw, 280px), 1fr))', gap: 'clamp(0.75rem, 2vw, 1rem)', width: '100%', boxSizing: 'border-box' },
+  iosWidget: { borderRadius: 'clamp(12px, 3vw, 16px)', padding: 'clamp(1rem, 2.5vw, 1.25rem)', backgroundColor: 'rgba(44, 44, 46, 0.6)', backdropFilter: 'blur(20px)', WebkitBackdropFilter: 'blur(20px)', border: '0.5px solid rgba(255, 255, 255, 0.08)', boxShadow: '0 4px 16px rgba(0, 0, 0, 0.5)', transition: 'all 0.3s cubic-bezier(0.4, 0, 0.2, 1)', minWidth: 0, overflow: 'hidden' },
+  wideWidget: { gridColumn: 'span 2' },
+  widgetHeader: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 'clamp(0.75rem, 2vw, 1rem)', paddingBottom: 'clamp(0.5rem, 1.5vw, 0.75rem)', borderBottom: '0.5px solid rgba(255, 255, 255, 0.06)', gap: '0.5rem' },
+  widgetTitle: { fontSize: 'clamp(0.85rem, 2.5vw, 1.05rem)', fontWeight: '600', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 },
+  headerActions: { display: 'flex', gap: 'clamp(0.4rem, 1.5vw, 0.5rem)', alignItems: 'center', flexShrink: 0 },
+  widgetDot: { width: 'clamp(6px, 1.5vw, 8px)', height: 'clamp(6px, 1.5vw, 8px)', borderRadius: '50%', flexShrink: 0 },
+  settingsButton: { width: 'clamp(28px, 7vw, 32px)', height: 'clamp(28px, 7vw, 32px)', borderRadius: 'clamp(6px, 2vw, 8px)', border: 'none', background: 'rgba(255, 255, 255, 0.08)', color: '#fff', fontSize: 'clamp(0.95rem, 2.5vw, 1.1rem)', fontWeight: '600', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
+  widgetContent: { display: 'flex', flexDirection: 'column', gap: 'clamp(0.75rem, 2vw, 1rem)' },
+  kpiValue: { fontSize: 'clamp(1.5rem, 8vw, 3.5rem)', fontWeight: '700', color: '#fff', textAlign: 'center', lineHeight: '1', letterSpacing: '-0.03em' },
+  kpiLabel: { fontSize: 'clamp(0.7rem, 2vw, 0.9rem)', fontWeight: '500', color: '#8e8e93', textAlign: 'center', marginTop: '0.5rem' },
+  emptyState: { textAlign: 'center', padding: 'clamp(1.5rem, 4vw, 2rem) clamp(0.75rem, 2vw, 1rem)', color: '#8e8e93', fontSize: 'clamp(0.75rem, 2vw, 0.9rem)' },
+  loadingContainer: { display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: '60vh', gap: 'clamp(1rem, 3vw, 1.5rem)', padding: 'clamp(1.5rem, 4vw, 2rem)' },
+  spinner: { width: 'clamp(40px, 10vw, 50px)', height: 'clamp(40px, 10vw, 50px)', border: '4px solid #3a3a3c', borderTop: '4px solid #007AFF', borderRadius: '50%', animation: 'spin 1s linear infinite' },
+  loadingText: { fontSize: 'clamp(0.8rem, 2vw, 0.9rem)', fontWeight: '500', color: '#8e8e93' },
+  errorBanner: { padding: 'clamp(0.75rem, 2vw, 1rem)', margin: 'clamp(0.75rem, 2vw, 1rem)', backgroundColor: '#3a3a3c', borderRadius: 'clamp(10px, 2.5vw, 12px)', display: 'flex', alignItems: 'center', gap: 'clamp(0.5rem, 1.5vw, 0.75rem)', fontSize: 'clamp(0.75rem, 2vw, 0.85rem)', color: '#FF3B30' },
+  errorIcon: { width: 'clamp(20px, 5vw, 24px)', height: 'clamp(20px, 5vw, 24px)', borderRadius: '50%', backgroundColor: '#FF3B30', color: 'white', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: '700', flexShrink: 0, fontSize: 'clamp(0.75rem, 2vw, 0.9rem)' },
+  settingsPanel: { marginBottom: 'clamp(0.75rem, 2vw, 1rem)', padding: 'clamp(0.75rem, 2vw, 1rem)', borderRadius: 'clamp(10px, 2.5vw, 12px)', backgroundColor: 'rgba(28, 28, 30, 0.8)', border: '0.5px solid rgba(255, 255, 255, 0.08)' },
+  settingRow: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 'clamp(0.75rem, 2vw, 1rem)', padding: '0.5rem 0', flexWrap: 'wrap' },
+  settingLabel: { fontSize: 'clamp(0.75rem, 2vw, 0.9rem)', fontWeight: '500', color: '#8e8e93' },
+  settingSelect: { padding: 'clamp(0.4rem, 1.5vw, 0.5rem) clamp(0.6rem, 2vw, 0.75rem)', fontSize: 'clamp(0.7rem, 2vw, 0.85rem)', borderRadius: 'clamp(6px, 2vw, 8px)', border: '0.5px solid rgba(255, 255, 255, 0.1)', backgroundColor: 'rgba(44, 44, 46, 0.6)', color: '#fff', outline: 'none', fontWeight: '500', cursor: 'pointer', minWidth: '100px', minHeight: '36px' },
+  gaugeContainer: { display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center', gap: 'clamp(0.75rem, 2vw, 1rem)', padding: 'clamp(0.75rem, 2vw, 1rem) 0' },
+  gaugeValue: { fontSize: 'clamp(1.75rem, 7vw, 2.75rem)', fontWeight: '700', letterSpacing: '-0.02em' },
+  gaugeLabel: { fontSize: 'clamp(0.65rem, 1.8vw, 0.8rem)', fontWeight: '600', color: '#8e8e93', letterSpacing: '1.5px', marginTop: '0.25rem', textTransform: 'uppercase' },
+  gaugeDetails: { width: '100%', display: 'flex', flexDirection: 'column', gap: '0.5rem' },
+  detailItem: { display: 'flex', justifyContent: 'space-between', padding: 'clamp(0.6rem, 2vw, 0.75rem)', borderRadius: 'clamp(8px, 2vw, 10px)', backgroundColor: 'rgba(28, 28, 30, 0.6)', gap: 'clamp(0.75rem, 2vw, 1rem)', flexWrap: 'wrap' },
+  detailLabel: { fontSize: 'clamp(0.7rem, 2vw, 0.85rem)', fontWeight: '500', color: '#8e8e93' },
+  detailValue: { fontSize: 'clamp(0.8rem, 2vw, 0.95rem)', fontWeight: '600', color: '#fff' },
+  messageStreamContainer: { display: 'flex', flexDirection: 'column', gap: 'clamp(0.6rem, 1.5vw, 0.75rem)', maxHeight: 'clamp(400px, 80vh, 500px)', overflowY: 'auto', paddingRight: '0.5rem' },
+  messageBubble: { padding: 'clamp(0.75rem, 2vw, 0.875rem) clamp(0.875rem, 2.5vw, 1rem)', borderRadius: 'clamp(12px, 3vw, 14px)', backgroundColor: 'rgba(28, 28, 30, 0.6)', border: '0.5px solid rgba(255, 255, 255, 0.06)', boxShadow: '0 2px 8px rgba(0, 0, 0, 0.2)' },
+  bubbleHeader: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 'clamp(0.4rem, 1.5vw, 0.5rem)', gap: '0.5rem', flexWrap: 'wrap' },
+  bubbleAuthor: { fontSize: 'clamp(0.75rem, 2vw, 0.9rem)', fontWeight: '600', color: '#fff' },
+  bubbleBadges: { display: 'flex', gap: 'clamp(0.4rem, 1.5vw, 0.5rem)', flexShrink: 0 },
+  sentimentBadge: { fontSize: 'clamp(0.6rem, 1.5vw, 0.75rem)', fontWeight: '700', color: '#000', padding: 'clamp(0.2rem, 1vw, 0.25rem) clamp(0.4rem, 1.5vw, 0.5rem)', borderRadius: 'clamp(5px, 1.5vw, 6px)' },
+  toxicBadge: { fontSize: 'clamp(0.55rem, 1.5vw, 0.7rem)', fontWeight: '700', color: '#fff', padding: 'clamp(0.2rem, 1vw, 0.25rem) clamp(0.4rem, 1.5vw, 0.5rem)', borderRadius: 'clamp(5px, 1.5vw, 6px)', textTransform: 'uppercase' },
+  bubbleText: { margin: 0, fontSize: 'clamp(0.75rem, 2vw, 0.9rem)', lineHeight: '1.5', color: '#d1d1d6', wordBreak: 'break-word' },
+  bubbleTime: { display: 'block', marginTop: 'clamp(0.4rem, 1.5vw, 0.5rem)', fontSize: 'clamp(0.6rem, 1.5vw, 0.75rem)', fontWeight: '500', color: '#636366' }
+}
+
+const styleSheet = document.createElement('style')
+styleSheet.textContent = `
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+@keyframes slideUp { from { transform: translateY(100%); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+
+.widget-row:hover { background-color: rgba(255, 255, 255, 0.05) !important; }
+.widget-panel-close-btn:hover { opacity: 0.85; }
+.unique-toggle:hover { filter: brightness(1.1); transform: scale(1.02); }
+.unique-toggle:active { transform: scale(0.98); }
+
+@media (max-width: 768px) {
+  .widget-toggle-text { display: none !important; }
+  .widget-panel-container { max-width: 100% !important; margin: 0 !important; border-radius: 20px 20px 0 0 !important; }
+}
+
+@media (max-width: 1024px) {
+  .wide-widget { grid-column: span 1 !important; }
+}
+
+body, html { overflow-x: hidden !important; width: 100% !important; max-width: 100vw !important; }
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: rgba(255, 255, 255, 0.05); border-radius: 3px; }
+::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.2); border-radius: 3px; }
+`
+document.head.appendChild(styleSheet)
 
 export default App

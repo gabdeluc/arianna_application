@@ -1,12 +1,13 @@
 """
-Backend Gateway - API Orchestrator
+Backend Gateway - API Orchestrator (v3.2)
 
-Questo backend orchestra i microservizi ML senza caricare modelli.
-Mantiene la logica business e i dati, delega ML a servizi specializzati.
+Orchestratore con:
+- SENTIMENT: Abstract Predictor Pattern → positive/neutral/negative
+- TOXICITY: Standalone Detector → is_toxic, severity, score
 
 Architecture:
 - BERT Sentiment Service: http://bert-sentiment:5001
-- E5 Embeddings Service: http://e5-embeddings:5002
+- BERT Toxicity Service: http://bert-toxicity:5003
 """
 
 from fastapi import FastAPI, HTTPException, Query, status
@@ -17,6 +18,17 @@ import httpx
 import random
 import os
 from config.config_loader import config_loader
+from models import (
+    PredictorFactory,
+    SentimentPredictor,
+    ToxicityDetector,  # Standalone detector
+    NormalizedPrediction,
+    BatchNormalizedPrediction,
+    ToxicityResult,  # Dedicated result
+    BatchToxicityResult,
+    SentimentLabel,
+    ToxicitySeverity
+)
 
 # ============================================
 # FASTAPI APP SETUP
@@ -24,8 +36,8 @@ from config.config_loader import config_loader
 
 app = FastAPI(
     title="Meeting Transcript API Gateway",
-    description="Backend orchestrator per microservizi di sentiment analysis",
-    version="2.0.0"
+    description="Backend orchestrator: Sentiment (abstract pattern) + Toxicity (standalone detector)",
+    version="3.2.0"
 )
 
 app.add_middleware(
@@ -41,13 +53,20 @@ app.add_middleware(
 # ============================================
 
 BERT_SERVICE_URL = os.getenv("BERT_SERVICE_URL", "http://bert-sentiment:5001")
-E5_SERVICE_URL = os.getenv("E5_SERVICE_URL", "http://e5-embeddings:5002")
+TOXICITY_SERVICE_URL = os.getenv("TOXICITY_SERVICE_URL", "http://bert-toxicity:5003")
 
-# HTTP client with timeout for service calls
+# HTTP client
 http_client = httpx.AsyncClient(timeout=30.0)
 
+# Predictor Factory
+predictor_factory = PredictorFactory(http_client)
+
+# Global predictors
+sentiment_predictor: Optional[SentimentPredictor] = None
+toxicity_detector: Optional[ToxicityDetector] = None  # Renamed: detector not predictor
+
 # ============================================
-# PYDANTIC MODELS (ORIGINALI)
+# PYDANTIC MODELS
 # ============================================
 
 class TranscriptEntry(BaseModel):
@@ -75,27 +94,21 @@ class TranscriptResponse(BaseModel):
 class MeetingResponse(BaseModel):
     metadata: MeetingMetadata
 
-# ============================================
-# SENTIMENT MODELS
-# ============================================
-
-class SentimentResult(BaseModel):
-    stars: float
-    sentiment: str
-    confidence: float
-
-class SentimentAnalysisRequest(BaseModel):
+# Request models for analysis
+class UnifiedAnalysisRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=5000)
 
-class BatchSentimentRequest(BaseModel):
+class BatchUnifiedAnalysisRequest(BaseModel):
     texts: List[str] = Field(..., max_items=100)
 
-class SimilaritySearchRequest(BaseModel):
-    query: str
-    top_k: int = Field(default=5, ge=1, le=20)
+class ToxicityAnalysisRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=5000)
+
+class BatchToxicityRequest(BaseModel):
+    texts: List[str] = Field(..., max_items=100)
 
 # ============================================
-# LOAD CONFIGURATION (ORIGINALE)
+# LOAD CONFIGURATION
 # ============================================
 
 SAMPLE_PHRASES = config_loader.get_sample_phrases()
@@ -106,11 +119,22 @@ GENERATION_CONFIG = config_loader.get_generation_config()
 PARTICIPANTS = [Participant(**p) for p in PARTICIPANTS_CONFIG]
 
 # ============================================
-# MOCK DATA GENERATION (ORIGINALE)
+# MOCK DATA GENERATION
 # ============================================
 
 def generate_mock_transcript(num_entries: int = 20) -> List[TranscriptEntry]:
-    """Genera transcript mock usando configurazione"""
+    """
+    Genera transcript mock con messaggi completamente random.
+    
+    Pesca casualmente da TUTTE le categorie del dataset (positive, neutral, toxic, ecc.)
+    per simulare una riunione realistica con variazioni naturali.
+    """
+    # Fix: Validazione arrays vuoti
+    if not PARTICIPANTS:
+        raise ValueError("PARTICIPANTS list is empty - cannot generate transcript")
+    if not SAMPLE_PHRASES:
+        raise ValueError("SAMPLE_PHRASES list is empty - cannot generate transcript")
+    
     transcript = []
     current_time = 0
     
@@ -120,7 +144,7 @@ def generate_mock_transcript(num_entries: int = 20) -> List[TranscriptEntry]:
     
     for i in range(num_entries):
         participant = random.choice(PARTICIPANTS)
-        text = random.choice(SAMPLE_PHRASES)
+        text = random.choice(SAMPLE_PHRASES)  # Completamente random dal pool
         duration = max(min_duration, len(text) // chars_per_sec)
         
         from_time = f"{current_time // 3600:02d}:{(current_time % 3600) // 60:02d}:{current_time % 60:02d}.000"
@@ -143,6 +167,7 @@ def generate_mock_transcript(num_entries: int = 20) -> List[TranscriptEntry]:
 MOCK_MEETINGS = {}
 for meeting_config in MEETINGS_CONFIG:
     meeting_id = meeting_config['id']
+    
     MOCK_MEETINGS[meeting_id] = {
         "metadata": MeetingMetadata(
             participants=PARTICIPANTS,
@@ -152,54 +177,29 @@ for meeting_config in MEETINGS_CONFIG:
     }
 
 # ============================================
-# MICROSERVICES COMMUNICATION HELPERS
+# STARTUP/SHUTDOWN HANDLERS
 # ============================================
 
-async def call_bert_service(endpoint: str, payload: dict) -> dict:
-    """
-    Chiama il servizio BERT per sentiment analysis
-    """
-    try:
-        response = await http_client.post(
-            f"{BERT_SERVICE_URL}/{endpoint}",
-            json=payload,
-            timeout=30.0
-        )
-        response.raise_for_status()
-        return response.json()
-    except httpx.TimeoutException:
-        raise HTTPException(
-            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            detail="BERT service timeout"
-        )
-    except httpx.HTTPError as e:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"BERT service error: {str(e)}"
-        )
+@app.on_event("startup")
+async def startup_event():
+    """Inizializza i predictors/detectors all'avvio"""
+    global sentiment_predictor, toxicity_detector
+    
+    sentiment_predictor = predictor_factory.create_sentiment_predictor(BERT_SERVICE_URL)
+    toxicity_detector = predictor_factory.create_toxicity_detector(TOXICITY_SERVICE_URL)
+    
+    print("✅ Models initialized:")
+    print(f"   - Sentiment Predictor (abstract): {BERT_SERVICE_URL}")
+    print(f"   - Toxicity Detector (standalone): {TOXICITY_SERVICE_URL}")
 
-async def call_e5_service(endpoint: str, payload: dict) -> dict:
-    """
-    Chiama il servizio E5 per embeddings/similarity
-    """
-    try:
-        response = await http_client.post(
-            f"{E5_SERVICE_URL}/{endpoint}",
-            json=payload,
-            timeout=30.0
-        )
-        response.raise_for_status()
-        return response.json()
-    except httpx.TimeoutException:
-        raise HTTPException(
-            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            detail="E5 service timeout"
-        )
-    except httpx.HTTPError as e:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"E5 service error: {str(e)}"
-        )
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup al shutdown"""
+    await http_client.aclose()
+
+# ============================================
+# HELPER FUNCTIONS
+# ============================================
 
 async def check_service_health(service_url: str) -> bool:
     """Verifica se un servizio è online"""
@@ -215,17 +215,14 @@ async def check_service_health(service_url: str) -> bool:
 
 @app.get("/")
 async def root():
-    """
-    Root endpoint con informazioni sul gateway e status dei servizi
-    """
-    # Check services health
+    """Root endpoint con informazioni sul gateway"""
     bert_healthy = await check_service_health(BERT_SERVICE_URL)
-    e5_healthy = await check_service_health(E5_SERVICE_URL)
+    toxicity_healthy = await check_service_health(TOXICITY_SERVICE_URL)
     
     return {
         "status": "ok",
-        "version": "2.0.0",
-        "architecture": "microservices",
+        "version": "3.2.0",
+        "architecture": "microservices: sentiment (abstract) + toxicity (standalone)",
         "gateway": "FastAPI Backend",
         "services": {
             "bert_sentiment": {
@@ -233,24 +230,37 @@ async def root():
                 "healthy": bert_healthy,
                 "port": 5001
             },
-            "e5_embeddings": {
-                "url": E5_SERVICE_URL,
-                "healthy": e5_healthy,
-                "port": 5002
+            "bert_toxicity": {
+                "url": TOXICITY_SERVICE_URL,
+                "healthy": toxicity_healthy,
+                "port": 5003
+            }
+        },
+        "output_formats": {
+            "sentiment": {
+                "type": "normalized (abstract pattern)",
+                "labels": ["positive", "neutral", "negative"],
+                "score_range": [0.0, 1.0]
+            },
+            "toxicity": {
+                "type": "dedicated (standalone detector)",
+                "fields": ["is_toxic", "toxicity_score", "severity"],
+                "severity_levels": ["low", "medium", "high"]
             }
         },
         "endpoints": {
-            "original": [
+            "meeting": [
                 "GET /meeting/{meetingId}",
-                "GET /meeting/{meetingId}/transcript/"
+                "GET /meeting/{meetingId}/transcript/",
+                "GET /meeting/{meetingId}/analysis"
             ],
             "sentiment": [
                 "POST /sentiment/analyze",
-                "POST /sentiment/batch",
-                "GET /meeting/{meetingId}/sentiment"
+                "POST /sentiment/batch"
             ],
-            "similarity": [
-                "POST /meeting/{meetingId}/similarity"
+            "toxicity": [
+                "POST /toxicity/detect",
+                "POST /toxicity/detect/batch"
             ],
             "utility": [
                 "GET /participants",
@@ -266,7 +276,7 @@ def health_check():
     return {"status": "healthy", "service": "backend-gateway"}
 
 # ============================================
-# ORIGINAL ENDPOINTS (INVARIATI)
+# MEETING ENDPOINTS
 # ============================================
 
 @app.get("/meeting/{meetingId}", response_model=MeetingResponse)
@@ -311,7 +321,6 @@ def get_transcript_filtered(
     
     transcript = meeting["transcript"]
     
-    # Filtra per partecipante se richiesto
     if participant_id:
         participant_name = next(
             (p.name for p in PARTICIPANTS if p.id == participant_id),
@@ -326,37 +335,20 @@ def get_transcript_filtered(
     }
 
 # ============================================
-# SENTIMENT ANALYSIS ENDPOINTS (NUOVI)
-# Orchestrano chiamate a BERT microservice
+# UNIFIED ANALYSIS ENDPOINT
 # ============================================
 
-@app.post("/sentiment/analyze")
-async def analyze_sentiment(request: SentimentAnalysisRequest):
-    """
-    Analizza sentiment di un singolo testo tramite BERT microservice
-    """
-    result = await call_bert_service("analyze", {"text": request.text})
-    return result
-
-@app.post("/sentiment/batch")
-async def analyze_sentiment_batch(request: BatchSentimentRequest):
-    """
-    Analizza sentiment per batch di testi tramite BERT microservice
-    """
-    result = await call_bert_service("batch", {"texts": request.texts})
-    return result
-
-@app.get("/meeting/{meetingId}/sentiment")
-async def get_transcript_with_sentiment(
+@app.get("/meeting/{meetingId}/analysis")
+async def get_transcript_with_unified_analysis(
     meetingId: str,
-    participant_id: Optional[str] = None,
-    include_embeddings: bool = Query(
-        False,
-        description="Includi embeddings E5 (384-dim) - computazionalmente costoso"
-    )
+    participant_id: Optional[str] = None
 ):
     """
-    Ottieni transcript arricchito con sentiment analysis
+    Ottieni transcript con SENTIMENT + TOXICITY analysis.
+    
+    Output formats:
+    - Sentiment: {label: positive/neutral/negative, score: 0-1}
+    - Toxicity: {is_toxic: bool, severity: low/medium/high, toxicity_score: 0-1}
     """
     # 1. Ottieni meeting
     meeting = MOCK_MEETINGS.get(meetingId)
@@ -385,118 +377,229 @@ async def get_transcript_with_sentiment(
             "transcript": [],
             "metadata": {
                 "language": "en",
-                "sentiment_stats": {
-                    "average_stars": 0,
-                    "positive_ratio": 0,
-                    "total_analyzed": 0
+                "formats": {
+                    "sentiment": "normalized (positive/neutral/negative)",
+                    "toxicity": "dedicated (is_toxic/severity/score)"
+                },
+                "stats": {
+                    "total_messages": 0,
+                    "sentiment": {},
+                    "toxicity": {}
                 }
             }
         }
     
-    # 4. Chiama BERT microservice per sentiment (batch efficiente)
-    sentiment_response = await call_bert_service("batch", {"texts": texts})
-    sentiments = sentiment_response["results"]
+    # 4. Sentiment prediction (batch)
+    sentiment_results = await sentiment_predictor.predict_batch(texts)
     
-    # 5. Opzionalmente chiama E5 microservice per embeddings
-    embeddings = None
-    if include_embeddings:
-        embedding_response = await call_e5_service("batch-embed", {"texts": texts})
-        embeddings = embedding_response["embeddings"]
+    # 5. Toxicity detection (batch) - NUOVO: usa detect() non predict()
+    toxicity_results = await toxicity_detector.detect_batch(texts)
     
-    # 6. Combina transcript con sentiment (e embeddings)
+    # Fix: Validazione lunghezze array prima di combinare
+    if len(sentiment_results.predictions) != len(transcript):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Sentiment predictions mismatch: expected {len(transcript)}, got {len(sentiment_results.predictions)}"
+        )
+    
+    if len(toxicity_results.results) != len(transcript):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Toxicity results mismatch: expected {len(transcript)}, got {len(toxicity_results.results)}"
+        )
+    
+    # 6. Combina transcript con analisi
     enriched_transcript = []
-    total_stars = 0
-    positive_count = 0
+    
+    # Stats accumulatori sentiment
+    sentiment_positive = 0
+    sentiment_neutral = 0
+    sentiment_negative = 0
+    total_sentiment_score = 0
+    
+    # Stats accumulatori toxicity (NUOVO formato)
+    toxic_count = 0
+    severity_low = 0
+    severity_medium = 0
+    severity_high = 0
+    total_toxicity_score = 0
     
     for i, entry in enumerate(transcript):
-        entry_dict = entry.dict(by_alias=True)
-        entry_dict['sentiment'] = sentiments[i]
+        sent_pred = sentiment_results.predictions[i]
+        tox_result = toxicity_results.results[i]  # NUOVO: result non prediction
         
-        if embeddings:
-            entry_dict['embedding'] = embeddings[i]
+        entry_dict = entry.dict(by_alias=True)
+        
+        # Sentiment (formato normalizzato)
+        entry_dict['sentiment'] = {
+            'label': sent_pred.label.value,
+            'score': sent_pred.score,
+            'confidence': sent_pred.confidence,
+            'raw': sent_pred.raw_output
+        }
+        
+        # Toxicity (formato dedicato) - NUOVO
+        entry_dict['toxicity'] = {
+            'is_toxic': tox_result.is_toxic,
+            'toxicity_score': tox_result.toxicity_score,
+            'severity': tox_result.severity.value,
+            'confidence': tox_result.confidence,
+            'raw': tox_result.raw_output
+        }
         
         enriched_transcript.append(entry_dict)
         
-        # Accumula per stats
-        total_stars += sentiments[i]['stars']
-        if sentiments[i]['stars'] >= 3.5:
-            positive_count += 1
+        # Accumula stats sentiment
+        if sent_pred.label == SentimentLabel.POSITIVE:
+            sentiment_positive += 1
+        elif sent_pred.label == SentimentLabel.NEUTRAL:
+            sentiment_neutral += 1
+        else:
+            sentiment_negative += 1
+        total_sentiment_score += sent_pred.score
+        
+        # Accumula stats toxicity (NUOVO)
+        if tox_result.is_toxic:
+            toxic_count += 1
+        
+        if tox_result.severity == ToxicitySeverity.LOW:
+            severity_low += 1
+        elif tox_result.severity == ToxicitySeverity.MEDIUM:
+            severity_medium += 1
+        else:
+            severity_high += 1
+        
+        total_toxicity_score += tox_result.toxicity_score
     
     # 7. Calcola statistiche aggregate
-    avg_stars = total_stars / len(sentiments)
-    positive_ratio = positive_count / len(sentiments)
+    num_messages = len(sentiment_results.predictions)
     
     return {
         "transcript": enriched_transcript,
         "metadata": {
             "language": "en",
-            "sentiment_stats": {
-                "average_stars": round(avg_stars, 2),
-                "positive_ratio": round(positive_ratio, 2),
-                "total_analyzed": len(sentiments)
+            "formats": {
+                "sentiment": "normalized (positive/neutral/negative, score 0-1)",
+                "toxicity": "dedicated (is_toxic bool, severity low/medium/high, score 0-1)"
+            },
+            "stats": {
+                "total_messages": num_messages,
+                "sentiment": {
+                    "distribution": {
+                        "positive": sentiment_positive,
+                        "neutral": sentiment_neutral,
+                        "negative": sentiment_negative
+                    },
+                    "average_score": round(total_sentiment_score / num_messages, 3),
+                    "positive_ratio": round(sentiment_positive / num_messages, 3)
+                },
+                "toxicity": {
+                    "toxic_count": toxic_count,
+                    "toxic_ratio": round(toxic_count / num_messages, 3),
+                    "severity_distribution": {
+                        "low": severity_low,
+                        "medium": severity_medium,
+                        "high": severity_high
+                    },
+                    "average_toxicity_score": round(total_toxicity_score / num_messages, 3)
+                }
             }
         }
     }
 
 # ============================================
-# SIMILARITY SEARCH ENDPOINTS (NUOVI)
-# Orchestrano chiamate a E5 microservice
+# SENTIMENT + TOXICITY ENDPOINTS
 # ============================================
 
-@app.post("/meeting/{meetingId}/similarity")
-async def find_similar_messages(
-    meetingId: str,
-    request: SimilaritySearchRequest
-):
+# SENTIMENT (Abstract Pattern)
+@app.post("/sentiment/analyze", response_model=NormalizedPrediction)
+async def analyze_sentiment(request: UnifiedAnalysisRequest):
     """
-    Trova messaggi semanticamente simili usando E5 microservice
+    Analizza sentiment di un singolo testo.
+    
+    Output normalizzato: {label: positive/neutral/negative, score: 0-1}
     """
-    # 1. Ottieni meeting
-    meeting = MOCK_MEETINGS.get(meetingId)
-    if not meeting:
+    if not sentiment_predictor:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Meeting {meetingId} not found"
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Sentiment predictor not initialized"
         )
     
-    transcript = meeting["transcript"]
+    try:
+        result = await sentiment_predictor.predict(request.text)
+        return result
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Sentiment prediction error: {str(e)}"
+        )
+
+@app.post("/sentiment/batch", response_model=BatchNormalizedPrediction)
+async def analyze_sentiment_batch(request: BatchUnifiedAnalysisRequest):
+    """Batch prediction sentiment"""
+    if not sentiment_predictor:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Sentiment predictor not initialized"
+        )
     
-    # 2. Estrai testi candidati
-    candidate_texts = [entry.text for entry in transcript]
+    try:
+        result = await sentiment_predictor.predict_batch(request.texts)
+        return result
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Sentiment batch prediction error: {str(e)}"
+        )
+
+# TOXICITY (Standalone Detector)
+@app.post("/toxicity/detect", response_model=ToxicityResult)
+async def detect_toxicity(request: ToxicityAnalysisRequest):
+    """
+    Rileva tossicità di un singolo testo.
     
-    if not candidate_texts:
-        return {
-            "query": request.query,
-            "similar_messages": []
-        }
+    Output dedicato:
+    - is_toxic: boolean (True se score > 0.5)
+    - severity: low/medium/high
+    - toxicity_score: 0-1
+    - confidence: 0-1
+    """
+    if not toxicity_detector:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Toxicity detector not initialized"
+        )
     
-    # 3. Chiama E5 microservice per similarity search
-    similarity_response = await call_e5_service("similarity", {
-        "query": request.query,
-        "candidates": candidate_texts,
-        "top_k": request.top_k
-    })
+    try:
+        result = await toxicity_detector.detect(request.text)
+        return result
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Toxicity detection error: {str(e)}"
+        )
+
+@app.post("/toxicity/detect/batch", response_model=BatchToxicityResult)
+async def detect_toxicity_batch(request: BatchToxicityRequest):
+    """
+    Rileva tossicità per batch di testi.
     
-    # 4. Arricchisci risultati con metadata del transcript
-    results = similarity_response["results"]
-    similar_messages = []
+    Batch processing è ~10x più veloce di chiamate singole.
+    """
+    if not toxicity_detector:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Toxicity detector not initialized"
+        )
     
-    for result in results:
-        # Trova entry originale per ottenere metadata
-        entry = next(e for e in transcript if e.text == result["text"])
-        
-        similar_messages.append({
-            "text": result["text"],
-            "similarity": result["similarity"],
-            "rank": result["rank"],
-            "speaker": entry.nickname,
-            "timestamp": entry.from_field
-        })
-    
-    return {
-        "query": request.query,
-        "similar_messages": similar_messages
-    }
+    try:
+        result = await toxicity_detector.detect_batch(request.texts)
+        return result
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Toxicity batch detection error: {str(e)}"
+        )
 
 # ============================================
 # UTILITY ENDPOINTS
@@ -524,16 +627,12 @@ def get_all_meetings():
 
 @app.get("/services/status")
 async def get_services_status():
-    """
-    Status dettagliato di tutti i microservizi
-    """
-    # Check health
+    """Status dettagliato di tutti i microservizi"""
     bert_healthy = await check_service_health(BERT_SERVICE_URL)
-    e5_healthy = await check_service_health(E5_SERVICE_URL)
+    toxicity_healthy = await check_service_health(TOXICITY_SERVICE_URL)
     
-    # Ottieni info dettagliate se servizi online
     bert_info = None
-    e5_info = None
+    toxicity_info = None
     
     if bert_healthy:
         try:
@@ -542,10 +641,10 @@ async def get_services_status():
         except:
             pass
     
-    if e5_healthy:
+    if toxicity_healthy:
         try:
-            response = await http_client.get(f"{E5_SERVICE_URL}/info", timeout=5.0)
-            e5_info = response.json()
+            response = await http_client.get(f"{TOXICITY_SERVICE_URL}/info", timeout=5.0)
+            toxicity_info = response.json()
         except:
             pass
     
@@ -554,13 +653,17 @@ async def get_services_status():
             "healthy": bert_healthy,
             "url": BERT_SERVICE_URL,
             "port": 5001,
-            "info": bert_info
+            "info": bert_info,
+            "predictor": "SentimentPredictor",
+            "output_format": "positive/neutral/negative (score 0-1)"
         },
-        "e5_embeddings": {
-            "healthy": e5_healthy,
-            "url": E5_SERVICE_URL,
-            "port": 5002,
-            "info": e5_info
+        "bert_toxicity": {
+            "healthy": toxicity_healthy,
+            "url": TOXICITY_SERVICE_URL,
+            "port": 5003,
+            "info": toxicity_info,
+            "predictor": "ToxicityPredictor",
+            "output_format": "positive/neutral/negative (score 0-1)"
         }
     }
 
@@ -575,10 +678,61 @@ def get_config():
     }
 
 # ============================================
-# SHUTDOWN HANDLER
+# DEBUG ENDPOINTS
 # ============================================
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Cleanup al shutdown"""
-    await http_client.aclose()
+@app.post("/debug/toxicity-test")
+async def debug_toxicity_test():
+    """
+    Test toxicity model su frasi problematiche.
+    
+    Usato per identificare false positive e verificare threshold.
+    """
+    if not toxicity_detector:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Toxicity detector not initialized"
+        )
+    
+    test_phrases = [
+        # Frasi innocue che NON dovrebbero essere tossiche
+        "Let me share my screen to show the dashboard.",
+        "Can everyone see the slides properly?",
+        "I'll send the document via email after this.",
+        "Great work everyone!",
+        "Thank you for your time.",
+        
+        # Frasi borderline
+        "I don't agree with this approach.",
+        "This is not what I expected.",
+        "I'm concerned about the timeline.",
+        
+        # Frasi chiaramente tossiche
+        "This is completely stupid.",
+        "You're wasting everyone's time.",
+        "You have no idea what you're talking about.",
+        "Shut up and let someone competent handle this."
+    ]
+    
+    results = []
+    for phrase in test_phrases:
+        try:
+            result = await toxicity_detector.detect(phrase)
+            results.append({
+                "text": phrase,
+                "toxicity_score": result.toxicity_score,
+                "is_toxic": result.is_toxic,
+                "severity": result.severity.value,
+                "confidence": result.confidence
+            })
+        except Exception as e:
+            results.append({
+                "text": phrase,
+                "error": str(e)
+            })
+    
+    return {
+        "test_phrases_count": len(test_phrases),
+        "results": results,
+        "note": "Check for false positives (innocent phrases marked toxic)"
+    }
